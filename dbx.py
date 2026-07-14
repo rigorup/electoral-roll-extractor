@@ -1,0 +1,262 @@
+"""Postgres + pgvector layer: connection, schema, normalisation, ingest.
+
+The schema is created idempotently on first use, so a fresh deploy needs no
+manual migration step.
+"""
+from __future__ import annotations
+
+import os
+import re
+
+import psycopg
+from psycopg.rows import dict_row
+
+
+# ---------------------------------------------------------------- connection
+def get_dsn() -> str:
+    dsn = os.getenv("DATABASE_URL", "")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is not set.")
+    # psycopg wants postgresql://, Coolify hands out postgres://
+    return re.sub(r"^postgres://", "postgresql://", dsn)
+
+
+def connect():
+    return psycopg.connect(get_dsn(), row_factory=dict_row, connect_timeout=10)
+
+
+def db_ready() -> tuple[bool, str]:
+    try:
+        with connect() as c:
+            v = c.execute("select version()").fetchone()["version"]
+        return True, v.split(",")[0]
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+# ---------------------------------------------------------------- schema
+SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS ingests (
+    id                SERIAL PRIMARY KEY,
+    source_file       TEXT NOT NULL,
+    constituency_no   TEXT,
+    constituency_name TEXT,
+    part_no           TEXT,
+    row_count         INT DEFAULT 0,
+    photo_count       INT DEFAULT 0,
+    ingested_at       TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS voters (
+    id                 BIGSERIAL PRIMARY KEY,
+    ingest_id          INT REFERENCES ingests(id) ON DELETE CASCADE,
+    constituency_no    TEXT,
+    constituency_name  TEXT,
+    part_no            TEXT,
+    serial_no          INT,
+    epic_no            TEXT,
+    name               TEXT,
+    relation_type      TEXT,
+    relation_name      TEXT,
+    house_number       TEXT,
+    age                INT,
+    gender             TEXT,
+    photo_id           TEXT,
+    -- normalised forms: linkage quality is won or lost here
+    name_norm          TEXT,
+    relation_name_norm TEXT,
+    house_norm         TEXT,
+    name_phonetic      TEXT,
+    created_at         TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (constituency_no, part_no, serial_no, epic_no)
+);
+
+CREATE INDEX IF NOT EXISTS voters_epic_idx      ON voters (epic_no);
+CREATE INDEX IF NOT EXISTS voters_name_norm_idx ON voters (name_norm);
+CREATE INDEX IF NOT EXISTS voters_house_idx     ON voters (constituency_no, house_norm);
+CREATE INDEX IF NOT EXISTS voters_phon_idx      ON voters (name_phonetic);
+CREATE INDEX IF NOT EXISTS voters_name_trgm_idx ON voters USING gin (name_norm gin_trgm_ops);
+
+-- Photos live in the DB (bytea): ~15KB x 50k = ~1GB, keeps the app stateless.
+CREATE TABLE IF NOT EXISTS photos (
+    id         BIGSERIAL PRIMARY KEY,
+    voter_id   BIGINT UNIQUE REFERENCES voters(id) ON DELETE CASCADE,
+    photo_id   TEXT,
+    image      BYTEA,
+    phash      BIGINT,          -- perceptual (dHash) -> catches reused images
+    embedding  vector(512),     -- face embedding, filled by a later batch job
+    face_found BOOLEAN,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS photos_phash_idx ON photos (phash);
+
+-- One row per suspicious finding. A flag is a LEAD, never a verdict.
+CREATE TABLE IF NOT EXISTS flags (
+    id               BIGSERIAL PRIMARY KEY,
+    rule             TEXT NOT NULL,
+    severity         TEXT,
+    score            REAL,
+    voter_id         BIGINT REFERENCES voters(id) ON DELETE CASCADE,
+    related_voter_id BIGINT REFERENCES voters(id) ON DELETE CASCADE,
+    details          JSONB,
+    created_at       TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (rule, voter_id, related_voter_id)
+);
+CREATE INDEX IF NOT EXISTS flags_rule_idx ON flags (rule);
+
+-- Human adjudication. These become the training labels for a later ranker.
+CREATE TABLE IF NOT EXISTS reviews (
+    id          BIGSERIAL PRIMARY KEY,
+    flag_id     BIGINT REFERENCES flags(id) ON DELETE CASCADE,
+    verdict     TEXT,   -- confirmed | legitimate | needs_info
+    reviewer    TEXT,
+    notes       TEXT,
+    reviewed_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS reviews_flag_idx ON reviews (flag_id);
+"""
+
+
+def init_schema() -> None:
+    with connect() as c:
+        c.execute(SCHEMA)
+        c.commit()
+
+
+# ---------------------------------------------------------------- normalise
+_HONORIFICS = r"^(SMT|SHRI|SRI|MR|MRS|MS|DR|LATE)\.?\s+"
+
+
+def norm_name(s: str | None) -> str:
+    if not s:
+        return ""
+    s = str(s).upper().strip()
+    s = re.sub(r"[^A-Z ]", " ", s)          # drop punctuation/digits
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(_HONORIFICS, "", s).strip()
+    return s
+
+
+def norm_house(s: str | None) -> str:
+    """E-72 / E 72 / E72 must all collapse to E72."""
+    if not s:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+
+def phonetic(s: str | None) -> str:
+    """Metaphone of the full name — tolerant of Indian transliteration drift
+    (BASFOR / BASPHOR / BUSFOR collapse together)."""
+    n = norm_name(s)
+    if not n:
+        return ""
+    try:
+        import jellyfish
+        return " ".join(jellyfish.metaphone(tok) for tok in n.split())
+    except Exception:
+        return n
+
+
+def to_int(v) -> int | None:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- photo hash
+def dhash(image_bytes: bytes) -> int | None:
+    """64-bit difference hash. Identical/near-identical images collide, which
+    is exactly what 'same photo reused under two identities' looks like."""
+    try:
+        import cv2
+        import numpy as np
+
+        arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        img = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
+        diff = img[:, 1:] > img[:, :-1]
+        bits = 0
+        for b in diff.flatten():
+            bits = (bits << 1) | int(b)
+        # store as signed BIGINT
+        return bits - (1 << 64) if bits >= (1 << 63) else bits
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- ingest
+VOTER_COLS = [
+    "constituency_no", "constituency_name", "part_no", "serial_no", "epic_no",
+    "name", "relation_type", "relation_name", "house_number", "age", "gender",
+    "photo_id", "name_norm", "relation_name_norm", "house_norm", "name_phonetic",
+]
+
+
+def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = None):
+    """Load one extracted roll (Excel rows + optional photo bytes keyed by
+    Photo_Id) into Postgres. Idempotent: re-ingesting the same roll updates
+    rather than duplicates. Returns (ingest_id, n_voters, n_photos)."""
+    photos = photos or {}
+    init_schema()
+
+    def g(row, key):
+        v = row.get(key)
+        return "" if v is None or str(v) == "nan" else str(v).strip()
+
+    with connect() as c:
+        first = df.iloc[0].to_dict() if len(df) else {}
+        ing = c.execute(
+            """INSERT INTO ingests (source_file, constituency_no,
+                                    constituency_name, part_no)
+               VALUES (%s,%s,%s,%s) RETURNING id""",
+            (source_file, g(first, "Constituency_No"),
+             g(first, "Constituency_Name"), g(first, "Part_No")),
+        ).fetchone()["id"]
+
+        n_v = n_p = 0
+        for _, r in df.iterrows():
+            row = r.to_dict()
+            name = g(row, "Name")
+            if not name:
+                continue
+            rel_name = g(row, "Relation_Name")
+            house = g(row, "House_Number")
+
+            vid = c.execute(
+                f"""INSERT INTO voters (ingest_id, {','.join(VOTER_COLS)})
+                    VALUES (%s,{','.join(['%s'] * len(VOTER_COLS))})
+                    ON CONFLICT (constituency_no, part_no, serial_no, epic_no)
+                    DO UPDATE SET name = EXCLUDED.name,
+                                  ingest_id = EXCLUDED.ingest_id
+                    RETURNING id""",
+                (ing, g(row, "Constituency_No"), g(row, "Constituency_Name"),
+                 g(row, "Part_No"), to_int(row.get("Serial_No")),
+                 g(row, "EPIC_No"), name, g(row, "Relation_Type"), rel_name,
+                 house, to_int(row.get("Age")), g(row, "Gender"),
+                 g(row, "Photo_Id"), norm_name(name), norm_name(rel_name),
+                 norm_house(house), phonetic(name)),
+            ).fetchone()["id"]
+            n_v += 1
+
+            pid = g(row, "Photo_Id")
+            blob = photos.get(pid)
+            if blob:
+                c.execute(
+                    """INSERT INTO photos (voter_id, photo_id, image, phash)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (voter_id) DO UPDATE
+                         SET image = EXCLUDED.image, phash = EXCLUDED.phash""",
+                    (vid, pid, blob, dhash(blob)),
+                )
+                n_p += 1
+
+        c.execute("UPDATE ingests SET row_count=%s, photo_count=%s WHERE id=%s",
+                  (n_v, n_p, ing))
+        c.commit()
+    return ing, n_v, n_p

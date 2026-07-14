@@ -6,3 +6,6 @@ openpyxl>=3.1
 python-dotenv>=1.0
 numpy>=1.26
 opencv-python-headless>=4.9   # voter-photo cropping (cv2)
+psycopg[binary]>=3.1          # Postgres driver
+pgvector>=0.2                 # face-embedding column support
+jellyfish>=1.0                # metaphone / fuzzy name matching
