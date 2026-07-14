@@ -1,0 +1,12 @@
+services:
+  electoral-roll:
+    build: .
+    container_name: electoral-roll
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      OCR_PROVIDER: ${OCR_PROVIDER:-mistral}
+      OCR_MODEL: ${OCR_MODEL:-mistral-ocr-latest}
+      STRUCTURE_MODEL: ${STRUCTURE_MODEL:-mistral-small-latest}
