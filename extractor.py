@@ -232,9 +232,22 @@ def _page_serial_markers(text: str) -> set[int]:
 # order, so when all three counts agree we can zip them 1:1. That fixes both
 # the pages the strict parser drops entirely (B) and the EPIC-off-by-one it
 # would otherwise pick up from the *next* voter.
+#   D (supplement)  |  798 | 1 | CRC0299412 | 799 | 1 | CRC0299446 |
+# "List of Additions" pages carry an extra numeric column (the supplement no.)
+# between the serial and the EPIC, so the serial is not always the integer
+# nearest the EPIC -- it is the FIRST of the run. Capturing the wrong one gave
+# every voter on the page serial "1", collapsing all of them into one row.
 _SERIAL_ANCHORED_RE = re.compile(
-    r"(?:\*{0,2})(\d{1,4})(?:\*{0,2})\s*\|?\s*"
-    r"(?=(?:[A-Z]{2,4}[0-9]{6,8}\b)|[Nn]ame\s*[:：])"
+    r"(?:^|\||\n)\s*"                          # a serial OPENS a table cell / line.
+                                               # Without this, "Part No. : 12" in the
+                                               # header wins and swallows the real
+                                               # serial, and an EPIC's own digits can
+                                               # be mistaken for one.
+    r"(?:\*{0,2})(\d{1,4})(?![0-9])(?:\*{0,2})"   # the serial itself
+    r"(?:\s*\|\s*\d{1,3}\b)*"                  # optional extra numeric cells
+    r"\s*\|?\s*"
+    r"(?=(?:[A-Z]{2,4}[0-9]{6,8}\b)|[Nn]ame\s*[:：])",
+    re.M,
 )
 
 

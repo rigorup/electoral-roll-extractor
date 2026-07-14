@@ -95,4 +95,27 @@ assert tissues["incomplete_rows"] == [], tissues
 # the page header ("...No and Name : 58-KANUBARI") must never become a voter
 assert all(r["Name"] != "58-KANUBARI" for r in trows)
 
+# ---- "List of Additions" supplement page: an EXTRA numeric column sits
+# ---- between the serial and the EPIC. The serial is therefore NOT the integer
+# ---- nearest the EPIC. Reading the wrong one gave every voter serial "1", so
+# ---- the whole page collapsed into a single row and vanished.
+ADDITIONS = """Assembly Constituency No and Name : 58-KANUBARI
+1- List of Additions 1 (29-10-2024 05-01-2025 )
+
+Part No. : 12
+
+|  798 | 1 | CRC0299412 | 799 | 1 | CRC0299446 | 800 | 1 | GYS0303487  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  Name : Anyen Arangham Fathers Name: Pongbo Arangham House Number : E-136 Age : 18 Gender : Female |   |  | Name : Thialamla Wangsu Others: Fenyo Wangcha House Number : E-32 Age : 31 Gender : Female |   |  | Name : JITEN RAI Fathers Name: RAMJI RAI House Number : E-173 Age : 35 Gender : Male |   |   |
+"""
+arows, aissues = build_rows([PageText(index=29, markdown=ADDITIONS)],
+                            method="regex")
+assert len(arows) == 3, f"additions page lost voters: {len(arows)}"
+a = {r["Serial_No"]: r for r in arows}
+# the real serials -- not the supplement column "1", and not the EPIC's digits
+assert set(a) == {"798", "799", "800"}, f"wrong serials: {sorted(a)}"
+assert a["798"]["EPIC_No"] == "CRC0299412" and a["798"]["Name"] == "Anyen Arangham"
+assert a["800"]["EPIC_No"] == "GYS0303487" and a["800"]["Name"] == "JITEN RAI"
+assert aissues["incomplete_rows"] == [], aissues
+
 print("\nALL ASSERTIONS PASSED")
