@@ -10,10 +10,113 @@ below either exclude relation_name or require corroborating fields.
 """
 from __future__ import annotations
 
+import math
+from collections import Counter
+from typing import Callable
+
+from psycopg.types.json import Json
+
 from dbx import connect, init_schema
 
-# Each rule: id -> (severity, human description, SQL inserting into flags)
-RULES: dict[str, tuple[str, str, str]] = {
+# ---------------------------------------------------------------- similarity
+# Two complementary record-linkage methods over ALL of a voter's data points
+# (name + relation + house + age + gender). Both build a candidate set with the
+# trigram index (cheap) and then re-score it; they differ in the similarity
+# they apply, so they flag genuinely different pairs:
+#
+#   fuzzy_dup   pg_trgm similarity() — trigram SET overlap (Jaccard-like),
+#               weighted across the fields, entirely in SQL.
+#   cosine_dup  TF-weighted trigram VECTOR cosine on the concatenated profile,
+#               computed in Python (frequency-aware, magnitude-normalised).
+#
+# Both BLOCK on the metaphone key (name_phonetic, indexed) to stay tractable at
+# scale — a full trigram self-join over tens of thousands of voters does not
+# finish in interactive time. Blocking only decides which pairs are *compared*;
+# the score still weighs every data point (name, relation, house, age, gender)
+# and can flag likely duplicates across different houses / parts / constituencies.
+#
+# Fairness note (see module docstring): name-based matching over-flags migrants
+# and married women, so both stay 'medium' leads and surface every field that
+# fed the score, for the reviewer to judge.
+FUZZY_THRESHOLD = 0.70      # composite weighted score to raise a fuzzy_dup flag
+COSINE_THRESHOLD = 0.80     # trigram-vector cosine to raise a cosine_dup flag
+CAND_AGE_WINDOW = 8         # blocking: only compare voters within this many years
+
+
+def _profile(name_norm: str, relation_norm: str, house_norm: str,
+             age, gender: str) -> str:
+    """The single string that represents one voter for cosine comparison —
+    every data point we hold, joined so trigrams span field boundaries."""
+    return " ".join(str(x) for x in (
+        name_norm or "", relation_norm or "", house_norm or "",
+        "" if age is None else age, gender or "")).strip()
+
+
+def _trigrams(s: str) -> "Counter[str]":
+    s = f"  {s} "                      # pad so start/end characters count
+    if len(s) < 3:
+        return Counter([s])
+    return Counter(s[i:i + 3] for i in range(len(s) - 2))
+
+
+def _cosine(a: "Counter[str]", b: "Counter[str]") -> float:
+    if not a or not b:
+        return 0.0
+    dot = sum(cnt * b.get(tri, 0) for tri, cnt in a.items())
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _run_cosine(c) -> None:
+    """Callable rule: TF-weighted trigram-vector cosine over the full voter
+    profile. Candidates come from the trigram index; cosine re-scores them."""
+    cand = c.execute(
+        """
+        SELECT a.id AS aid, b.id AS bid, a.name AS aname, b.name AS bname,
+               a.name_norm AS an, b.name_norm AS bn,
+               coalesce(a.relation_name_norm,'') AS ar,
+               coalesce(b.relation_name_norm,'') AS br,
+               a.house_norm AS ah, b.house_norm AS bh,
+               a.age AS aa, b.age AS ba, a.gender AS ag, b.gender AS bg,
+               a.epic_no AS ae, b.epic_no AS be
+        FROM voters a JOIN voters b
+          ON a.name_phonetic = b.name_phonetic
+         AND a.id < b.id
+         AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= %s
+        WHERE a.name_phonetic <> ''
+        """,
+        (CAND_AGE_WINDOW,),
+    ).fetchall()
+
+    batch = []
+    for r in cand:
+        ta = _trigrams(_profile(r["an"], r["ar"], r["ah"], r["aa"], r["ag"]))
+        tb = _trigrams(_profile(r["bn"], r["br"], r["bh"], r["ba"], r["bg"]))
+        cos = _cosine(ta, tb)
+        if cos >= COSINE_THRESHOLD:
+            batch.append((
+                round(cos, 3), r["aid"], r["bid"],
+                Json({"method": "cosine", "cosine": round(cos, 3),
+                      "name_a": r["aname"], "name_b": r["bname"],
+                      "age_a": r["aa"], "age_b": r["ba"],
+                      "gender_a": r["ag"], "gender_b": r["bg"],
+                      "same_house": bool(r["ah"] and r["ah"] == r["bh"]),
+                      "epic_a": r["ae"], "epic_b": r["be"]}),
+            ))
+    if batch:
+        c.executemany(
+            """INSERT INTO flags (rule, severity, score, voter_id,
+                                  related_voter_id, details)
+               VALUES ('cosine_dup', 'medium', %s, %s, %s, %s)
+               ON CONFLICT DO NOTHING""",
+            batch,
+        )
+
+
+# Each rule: id -> (severity, human description, SQL string OR callable(cursor)).
+# A callable does its own INSERTs into `flags`; a string is executed as-is.
+RULES: dict[str, tuple[str, str, str | Callable]] = {
 
     # ---- exact duplicate EPIC: the same voter ID card number twice.
     "dup_epic": ("high", "Same EPIC number on more than one record", """
@@ -134,6 +237,53 @@ RULES: dict[str, tuple[str, str, str]] = {
         WHERE epic_no <> '' AND epic_no !~ '^[A-Z]{3}[0-9]{7}$'
         ON CONFLICT DO NOTHING;
     """),
+
+    # ---- FUZZY method: weighted trigram-similarity across every data point.
+    # Trigram SET overlap (pg_trgm similarity(), Jaccard-like) on name + relation,
+    # combined with same-house, age closeness and gender agreement. Catches
+    # spelling drift / OCR noise that exact and phonetic rules miss.
+    "fuzzy_dup": ("medium",
+                  "Fuzzy method — weighted trigram similarity across name, "
+                  "relation, house, age and gender", f"""
+        INSERT INTO flags (rule, severity, score, voter_id, related_voter_id, details)
+        SELECT 'fuzzy_dup', 'medium', p.score, p.aid, p.bid, p.details
+        FROM (
+            SELECT a.id AS aid, b.id AS bid,
+                   ( 0.45 * similarity(a.name_norm, b.name_norm)
+                   + 0.20 * similarity(coalesce(a.relation_name_norm,''),
+                                       coalesce(b.relation_name_norm,''))
+                   + 0.15 * (a.house_norm = b.house_norm AND a.house_norm <> '')::int
+                   + 0.10 * greatest(0, 1 - abs(coalesce(a.age,0)
+                                                - coalesce(b.age,0)) / 10.0)
+                   + 0.10 * (a.gender = b.gender)::int )::real AS score,
+                   jsonb_build_object(
+                       'method', 'fuzzy',
+                       'name_a', a.name, 'name_b', b.name,
+                       'name_sim', round(similarity(a.name_norm, b.name_norm)::numeric, 3),
+                       'relation_sim', round(similarity(
+                           coalesce(a.relation_name_norm,''),
+                           coalesce(b.relation_name_norm,''))::numeric, 3),
+                       'same_house', (a.house_norm = b.house_norm AND a.house_norm <> ''),
+                       'age_a', a.age, 'age_b', b.age,
+                       'gender_a', a.gender, 'gender_b', b.gender,
+                       'epic_a', a.epic_no, 'epic_b', b.epic_no) AS details
+            FROM voters a JOIN voters b
+              ON a.name_phonetic = b.name_phonetic
+             AND a.id < b.id
+             AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= {CAND_AGE_WINDOW}
+            WHERE a.name_phonetic <> ''
+        ) p
+        WHERE p.score >= {FUZZY_THRESHOLD}
+        ON CONFLICT DO NOTHING;
+    """),
+
+    # ---- COSINE method: TF-weighted trigram-vector cosine over the full
+    # voter profile (name+relation+house+age+gender). Frequency-aware and
+    # magnitude-normalised, so it ranks differently from the set-based fuzzy
+    # rule. Implemented in Python (see _run_cosine).
+    "cosine_dup": ("medium",
+                   "Cosine method — TF-weighted trigram-vector cosine over the "
+                   "full voter profile", _run_cosine),
 }
 
 
@@ -148,7 +298,11 @@ def run_rules(selected: list[str] | None = None) -> dict[str, int]:
                 continue
             before = c.execute("SELECT count(*) n FROM flags WHERE rule=%s",
                                (name,)).fetchone()["n"]
-            c.execute(RULES[name][2])
+            spec = RULES[name][2]
+            if callable(spec):
+                spec(c)                      # callable rule does its own INSERTs
+            else:
+                c.execute(spec)              # SQL rule executed as-is
             after = c.execute("SELECT count(*) n FROM flags WHERE rule=%s",
                               (name,)).fetchone()["n"]
             added[name] = after - before
