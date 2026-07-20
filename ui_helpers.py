@@ -64,12 +64,12 @@ def _voter_md(f, side: str) -> str:
             f"Age {f['age_' + side]} · {f['gender_' + side]}")
 
 
-def flag_card(f) -> None:
+def flag_card(f, year: int | None = None) -> None:
     """Body of one flag expander: pair of voter cards, or — for a grouped
     house_overload flag — every occupant plus the reconstructed family tree."""
     d = f.get("details") or {}
     if f["rule"] == "house_overload" and d.get("house_norm"):
-        _house_overload_card(f, d)
+        _house_overload_card(f, d, year)
         return
 
     cols = st.columns([2, 1, 2, 1]) if f["name_b"] else st.columns([2, 1])
@@ -85,8 +85,8 @@ def flag_card(f) -> None:
     st.json(f["details"], expanded=False)
 
 
-def _house_overload_card(f, d: dict) -> None:
-    members = house_members(d.get("constituency_no"), d["house_norm"])
+def _house_overload_card(f, d: dict, year: int | None = None) -> None:
+    members = house_members(d.get("constituency_no"), d["house_norm"], year)
     if not members:
         st.warning("No electors found for this house any more (data re-ingested?).")
         st.json(d, expanded=False)
@@ -170,12 +170,12 @@ def _pdf_draw_voter(page, x: float, y: float, w: float, h: float,
     page.insert_textbox(body, "\n".join(lines[1:]), fontsize=7, fontname="helv")
 
 
-def build_flags_pdf(rule_filter: str | None) -> bytes:
+def build_flags_pdf(rule_filter: str | None, year: int | None = None) -> bytes:
     """PDF of every flag matching the filter: each flag is one side-by-side
     comparison (voter A vs voter B) with both photos and all details;
     _PDF_PER_PAGE comparisons per A4 page."""
     import fitz
-    rows = all_flags_for_export(rule_filter)
+    rows = all_flags_for_export(rule_filter, year)
     ids = set()
     for f in rows:
         ids.add(f["voter_id"])
@@ -198,7 +198,8 @@ def build_flags_pdf(rule_filter: str | None) -> bytes:
             page = doc.new_page(width=pw, height=phg)
             page.insert_textbox(
                 fitz.Rect(M, 20, pw - M, 44),
-                f"Fraud flags - {rule_filter or 'all rules'}   "
+                f"Fraud flags - {rule_filter or 'all rules'}"
+                f"{f' - {year}' if year else ''}   "
                 f"(page {len(doc)},  {len(rows)} flag(s) total)",
                 fontsize=11, fontname="hebo")
             page.draw_line(fitz.Point(M, 46), fitz.Point(pw - M, 46),

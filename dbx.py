@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS ingests (
 CREATE TABLE IF NOT EXISTS voters (
     id                 BIGSERIAL PRIMARY KEY,
     ingest_id          INT REFERENCES ingests(id) ON DELETE CASCADE,
+    year               INT,
     constituency_no    TEXT,
     constituency_name  TEXT,
     part_no            TEXT,
@@ -70,8 +71,7 @@ CREATE TABLE IF NOT EXISTS voters (
     relation_name_norm TEXT,
     house_norm         TEXT,
     name_phonetic      TEXT,
-    created_at         TIMESTAMPTZ DEFAULT now(),
-    UNIQUE (constituency_no, part_no, serial_no, epic_no)
+    created_at         TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS voters_epic_idx      ON voters (epic_no);
@@ -132,6 +132,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS flags_dedup_idx
 DELETE FROM flags f
  WHERE f.rule = 'house_overload' AND NOT (f.details ? 'house_norm')
    AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.flag_id = f.id);
+
+-- ---------------------------------------------------------------- year split
+-- Each roll belongs to a revision year; the detection rules run within one
+-- year at a time (comparing 2025 against 2026 would flag every returning
+-- voter as a duplicate).
+ALTER TABLE voters  ADD COLUMN IF NOT EXISTS year INT;
+ALTER TABLE ingests ADD COLUMN IF NOT EXISTS year INT;
+
+-- Everything loaded before this column existed is the 2025 roll.
+UPDATE voters  SET year = 2025 WHERE year IS NULL;
+UPDATE ingests SET year = 2025 WHERE year IS NULL;
+ALTER TABLE voters ALTER COLUMN year SET NOT NULL;
+
+-- The original key omitted year, so re-uploading the same seat for a later
+-- year would UPDATE the previous year's row instead of adding a new one --
+-- silently destroying the earlier roll. The key must include year.
+ALTER TABLE voters
+    DROP CONSTRAINT IF EXISTS voters_constituency_no_part_no_serial_no_epic_no_key;
+CREATE UNIQUE INDEX IF NOT EXISTS voters_year_ac_part_serial_epic_idx
+    ON voters (year, constituency_no, part_no, serial_no, epic_no);
+CREATE INDEX IF NOT EXISTS voters_year_idx ON voters (year);
 """
 
 
@@ -207,17 +228,40 @@ def dhash(image_bytes: bytes) -> int | None:
 
 # ---------------------------------------------------------------- ingest
 VOTER_COLS = [
+    "year",
     "constituency_no", "constituency_name", "part_no", "serial_no", "epic_no",
     "name", "relation_type", "relation_name", "house_number", "age", "gender",
     "photo_id", "name_norm", "relation_name_norm", "house_norm", "name_phonetic",
 ]
 
+DEFAULT_YEAR = 2025          # what the pre-year-column data was
 
-def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = None):
+
+def year_from_filename(name: str) -> int | None:
+    """Rolls are named like '2025-EROLLGEN-S02-58-FinalRoll-...' — pull the
+    revision year out so the ingest form can pre-fill it."""
+    m = re.search(r"(19|20)\d{2}", str(name or ""))
+    return int(m.group(0)) if m else None
+
+
+def available_years() -> list[int]:
+    """Years that actually have voters loaded, newest first."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT DISTINCT year FROM voters WHERE year IS NOT NULL "
+            "ORDER BY year DESC").fetchall()
+    return [r["year"] for r in rows]
+
+
+def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = None,
+                     year: int | None = None):
     """Load one extracted roll (Excel rows + optional photo bytes keyed by
-    Photo_Id) into Postgres. Idempotent: re-ingesting the same roll updates
-    rather than duplicates. Returns (ingest_id, n_voters, n_photos)."""
+    Photo_Id) into Postgres under a revision `year`. Idempotent per year:
+    re-ingesting the same roll for the same year updates rather than
+    duplicates, while the same seat for a different year is a separate row.
+    Returns (ingest_id, n_voters, n_photos)."""
     photos = photos or {}
+    year = int(year or year_from_filename(source_file) or DEFAULT_YEAR)
     init_schema()
 
     def g(row, key):
@@ -228,10 +272,10 @@ def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = Non
         first = df.iloc[0].to_dict() if len(df) else {}
         ing = c.execute(
             """INSERT INTO ingests (source_file, constituency_no,
-                                    constituency_name, part_no)
-               VALUES (%s,%s,%s,%s) RETURNING id""",
+                                    constituency_name, part_no, year)
+               VALUES (%s,%s,%s,%s,%s) RETURNING id""",
             (source_file, g(first, "Constituency_No"),
-             g(first, "Constituency_Name"), g(first, "Part_No")),
+             g(first, "Constituency_Name"), g(first, "Part_No"), year),
         ).fetchone()["id"]
 
         n_v = n_p = 0
@@ -246,11 +290,12 @@ def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = Non
             vid = c.execute(
                 f"""INSERT INTO voters (ingest_id, {','.join(VOTER_COLS)})
                     VALUES (%s,{','.join(['%s'] * len(VOTER_COLS))})
-                    ON CONFLICT (constituency_no, part_no, serial_no, epic_no)
+                    ON CONFLICT (year, constituency_no, part_no, serial_no,
+                                 epic_no)
                     DO UPDATE SET name = EXCLUDED.name,
                                   ingest_id = EXCLUDED.ingest_id
                     RETURNING id""",
-                (ing, g(row, "Constituency_No"), g(row, "Constituency_Name"),
+                (ing, year, g(row, "Constituency_No"), g(row, "Constituency_Name"),
                  g(row, "Part_No"), to_int(row.get("Serial_No")),
                  g(row, "EPIC_No"), name, g(row, "Relation_Type"), rel_name,
                  house, to_int(row.get("Age")), g(row, "Gender"),

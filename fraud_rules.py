@@ -68,7 +68,7 @@ def _cosine(a: "Counter[str]", b: "Counter[str]") -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
-def _run_cosine(c) -> None:
+def _run_cosine(c, year: int) -> None:
     """Callable rule: TF-weighted trigram-vector cosine over the full voter
     profile. Candidates come from the trigram index; cosine re-scores them."""
     cand = c.execute(
@@ -83,10 +83,11 @@ def _run_cosine(c) -> None:
         FROM voters a JOIN voters b
           ON a.name_phonetic = b.name_phonetic
          AND a.id < b.id
-         AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= %s
+         AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= %(win)s
+         AND a.year = %(year)s AND b.year = %(year)s
         WHERE a.name_phonetic <> ''
         """,
-        (CAND_AGE_WINDOW,),
+        {"win": CAND_AGE_WINDOW, "year": year},
     ).fetchall()
 
     batch = []
@@ -126,6 +127,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                jsonb_build_object('epic', a.epic_no, 'name_a', a.name, 'name_b', b.name)
         FROM voters a JOIN voters b
           ON a.epic_no = b.epic_no AND a.id < b.id
+         AND a.year = %(year)s AND b.year = %(year)s
         WHERE a.epic_no <> ''
         ON CONFLICT DO NOTHING;
     """),
@@ -145,6 +147,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
          AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= 1
          AND a.epic_no <> b.epic_no
          AND a.id < b.id
+         AND a.year = %(year)s AND b.year = %(year)s
         WHERE a.name_norm <> '' AND a.house_norm <> ''
         ON CONFLICT DO NOTHING;
     """),
@@ -164,6 +167,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
          AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= 1
          AND a.part_no <> b.part_no
          AND a.id < b.id
+         AND a.year = %(year)s AND b.year = %(year)s
         WHERE a.name_norm <> '' AND a.relation_name_norm <> ''
         ON CONFLICT DO NOTHING;
     """),
@@ -182,6 +186,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
          AND a.name_norm <> b.name_norm           -- spelt differently
          AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= 2
          AND a.id < b.id
+         AND a.year = %(year)s AND b.year = %(year)s
         WHERE a.name_phonetic <> '' AND a.house_norm <> ''
         ON CONFLICT DO NOTHING;
     """),
@@ -195,8 +200,8 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                                   'epic_a', va.epic_no, 'epic_b', vb.epic_no)
         FROM photos pa
         JOIN photos pb ON pa.phash = pb.phash AND pa.voter_id < pb.voter_id
-        JOIN voters va ON va.id = pa.voter_id
-        JOIN voters vb ON vb.id = pb.voter_id
+        JOIN voters va ON va.id = pa.voter_id AND va.year = %(year)s
+        JOIN voters vb ON vb.id = pb.voter_id AND vb.year = %(year)s
         WHERE pa.phash IS NOT NULL AND va.epic_no <> vb.epic_no
         ON CONFLICT DO NOTHING;
     """),
@@ -214,7 +219,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
         FROM (SELECT constituency_no, house_norm,
                      min(id) AS rep_id, count(*) AS n,
                      min(house_number) AS house
-              FROM voters WHERE house_norm <> ''
+              FROM voters WHERE house_norm <> '' AND year = %(year)s
               GROUP BY 1, 2 HAVING count(*) > 15) h
         ON CONFLICT DO NOTHING;
     """),
@@ -226,6 +231,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                jsonb_build_object('age', age, 'name', name)
         FROM voters
         WHERE age IS NOT NULL AND (age < 18 OR age > 105)
+          AND year = %(year)s
         ON CONFLICT DO NOTHING;
     """),
 
@@ -236,6 +242,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                jsonb_build_object('epic', epic_no, 'name', name)
         FROM voters
         WHERE epic_no <> '' AND epic_no !~ '^[A-Z]{3}[0-9]{7}$'
+          AND year = %(year)s
         ON CONFLICT DO NOTHING;
     """),
 
@@ -272,6 +279,7 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
               ON a.name_phonetic = b.name_phonetic
              AND a.id < b.id
              AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= {CAND_AGE_WINDOW}
+             AND a.year = %(year)s AND b.year = %(year)s
             WHERE a.name_phonetic <> ''
         ) p
         WHERE p.score >= {FUZZY_THRESHOLD}
@@ -288,9 +296,17 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
 }
 
 
-def run_rules(selected: list[str] | None = None) -> dict[str, int]:
-    """Run rules and return {rule: new_flags_added}."""
+def run_rules(selected: list[str] | None = None,
+              year: int | None = None) -> dict[str, int]:
+    """Run rules over one revision year and return {rule: new_flags_added}.
+
+    Every rule compares voters *within* `year` only: the same person legitimately
+    reappears in the next year's roll, so cross-year comparison would flag the
+    whole electorate."""
     init_schema()
+    if year is None:
+        raise ValueError("run_rules needs a year to scope the comparison")
+    year = int(year)
     names = selected or list(RULES)
     added: dict[str, int] = {}
     with connect() as c:
@@ -301,9 +317,9 @@ def run_rules(selected: list[str] | None = None) -> dict[str, int]:
                                (name,)).fetchone()["n"]
             spec = RULES[name][2]
             if callable(spec):
-                spec(c)                      # callable rule does its own INSERTs
+                spec(c, year)                # callable rule does its own INSERTs
             else:
-                c.execute(spec)              # SQL rule executed as-is
+                c.execute(spec, {"year": year})
             after = c.execute("SELECT count(*) n FROM flags WHERE rule=%s",
                               (name,)).fetchone()["n"]
             added[name] = after - before
@@ -311,23 +327,39 @@ def run_rules(selected: list[str] | None = None) -> dict[str, int]:
     return added
 
 
-def clear_flags() -> None:
+def clear_flags(year: int | None = None) -> None:
+    """Drop flags. With a year, only that year's flags go (a flag belongs to
+    the year of the voter it points at), so clearing 2026 leaves 2025 intact."""
     with connect() as c:
-        c.execute("DELETE FROM flags")
+        if year is None:
+            c.execute("DELETE FROM flags")
+        else:
+            c.execute(
+                """DELETE FROM flags f USING voters va
+                   WHERE va.id = f.voter_id AND va.year = %s""", (int(year),))
         c.commit()
 
 
-def flag_summary():
+def flag_summary(year: int | None = None):
+    q = """
+        SELECT f.rule, f.severity, count(*) AS flags,
+               count(r.id) AS reviewed
+        FROM flags f
+        JOIN voters va ON va.id = f.voter_id
+        LEFT JOIN reviews r ON r.flag_id = f.id
+        WHERE TRUE
+    """
+    params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
+    q += " GROUP BY 1,2 ORDER BY flags DESC"
     with connect() as c:
-        return c.execute("""
-            SELECT f.rule, f.severity, count(*) AS flags,
-                   count(r.id) AS reviewed
-            FROM flags f LEFT JOIN reviews r ON r.flag_id = f.id
-            GROUP BY 1,2 ORDER BY flags DESC
-        """).fetchall()
+        return c.execute(q, params).fetchall()
 
 
-def open_flags(rule: str | None = None, limit: int = 200):
+def open_flags(rule: str | None = None, limit: int = 200,
+               year: int | None = None):
     """Flags awaiting human review, most severe first."""
     q = """
         SELECT f.id, f.rule, f.severity, f.score, f.details,
@@ -345,6 +377,9 @@ def open_flags(rule: str | None = None, limit: int = 200):
         WHERE r.id IS NULL
     """
     params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
     if rule:
         q += " AND f.rule = %s"
         params.append(rule)
@@ -356,19 +391,22 @@ def open_flags(rule: str | None = None, limit: int = 200):
         return c.execute(q, params).fetchall()
 
 
-def house_members(constituency_no: str | None, house_norm: str):
+def house_members(constituency_no: str | None, house_norm: str,
+                  year: int | None = None):
     """Every elector registered at one (constituency, normalised house)."""
+    q = """SELECT id, name, name_norm, relation_type, relation_name,
+                  relation_name_norm, age, gender, serial_no, part_no,
+                  house_number, epic_no, constituency_no
+           FROM voters
+           WHERE coalesce(constituency_no,'') = coalesce(%s,'')
+             AND house_norm = %s"""
+    params: list = [constituency_no, house_norm]
+    if year is not None:
+        q += " AND year = %s"
+        params.append(int(year))
+    q += " ORDER BY part_no, serial_no NULLS LAST, id"
     with connect() as c:
-        return c.execute(
-            """SELECT id, name, name_norm, relation_type, relation_name,
-                      relation_name_norm, age, gender, serial_no, part_no,
-                      house_number, epic_no, constituency_no
-               FROM voters
-               WHERE coalesce(constituency_no,'') = coalesce(%s,'')
-                 AND house_norm = %s
-               ORDER BY part_no, serial_no NULLS LAST, id""",
-            (constituency_no, house_norm),
-        ).fetchall()
+        return c.execute(q, params).fetchall()
 
 
 # Latest verdict wins when a flag was re-adjudicated.
@@ -380,7 +418,7 @@ _LATEST_REVIEW = """
 
 
 def reviewed_flags(verdict: str | None = None, rule: str | None = None,
-                   limit: int = 200):
+                   limit: int = 200, year: int | None = None):
     """Flags that already have a verdict, grouped confirmed -> legitimate ->
     needs_info (newest review first inside each group), so they can be
     revisited later."""
@@ -401,6 +439,9 @@ def reviewed_flags(verdict: str | None = None, rule: str | None = None,
         WHERE TRUE
     """
     params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
     if verdict:
         q += " AND r.verdict = %s"
         params.append(verdict)
@@ -416,14 +457,21 @@ def reviewed_flags(verdict: str | None = None, rule: str | None = None,
         return c.execute(q, params).fetchall()
 
 
-def reviewed_summary():
+def reviewed_summary(year: int | None = None):
     """{verdict: count} using each flag's latest verdict."""
+    q = f"""
+        SELECT r.verdict, count(*) AS n
+        FROM flags f {_LATEST_REVIEW}
+        JOIN voters va ON va.id = f.voter_id
+        WHERE TRUE
+    """
+    params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
+    q += " GROUP BY 1"
     with connect() as c:
-        rows = c.execute(f"""
-            SELECT r.verdict, count(*) AS n
-            FROM flags f {_LATEST_REVIEW}
-            GROUP BY 1
-        """).fetchall()
+        rows = c.execute(q, params).fetchall()
     return {row["verdict"]: row["n"] for row in rows}
 
 
@@ -453,7 +501,7 @@ _LATEST_REVIEW_LEFT = """
 """
 
 
-def all_flags_for_export(rule: str | None = None):
+def all_flags_for_export(rule: str | None = None, year: int | None = None):
     """Every flag, both sides' full voter details, and latest verdict (if
     reviewed) — most severe / most recent first. Feeds the Excel export."""
     q = f"""
@@ -475,6 +523,9 @@ def all_flags_for_export(rule: str | None = None):
         WHERE TRUE
     """
     params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
     if rule:
         q += " AND f.rule = %s"
         params.append(rule)
@@ -484,27 +535,36 @@ def all_flags_for_export(rule: str | None = None):
         return c.execute(q, params).fetchall()
 
 
-def house_overload_members_for_export(rule: str | None = None):
+def house_overload_members_for_export(rule: str | None = None,
+                                      year: int | None = None):
     """One row per occupant for every open house_overload flag — mirrors the
     'All electors in this house' table in the review UI."""
     if rule not in (None, "house_overload"):
         return []
+    fq = """SELECT f.id AS flag_id, f.details FROM flags f
+            JOIN voters va ON va.id = f.voter_id
+            WHERE f.rule = 'house_overload'"""
+    fp: list = []
+    if year is not None:
+        fq += " AND va.year = %s"
+        fp.append(int(year))
     with connect() as c:
-        flags = c.execute("""
-            SELECT id AS flag_id, details FROM flags WHERE rule = 'house_overload'
-        """).fetchall()
+        flags = c.execute(fq, fp).fetchall()
         out = []
         for fl in flags:
             d = fl["details"] or {}
-            members = c.execute(
-                """SELECT id, name, relation_type, relation_name, age, gender,
-                          serial_no, part_no, house_number, epic_no, constituency_no
-                   FROM voters
-                   WHERE coalesce(constituency_no,'') = coalesce(%s,'')
-                     AND house_norm = %s
-                   ORDER BY part_no, serial_no NULLS LAST, id""",
-                (d.get("constituency_no"), d.get("house_norm")),
-            ).fetchall()
+            mq = """SELECT id, name, relation_type, relation_name, age, gender,
+                           serial_no, part_no, house_number, epic_no,
+                           constituency_no
+                    FROM voters
+                    WHERE coalesce(constituency_no,'') = coalesce(%s,'')
+                      AND house_norm = %s"""
+            mp: list = [d.get("constituency_no"), d.get("house_norm")]
+            if year is not None:
+                mq += " AND year = %s"
+                mp.append(int(year))
+            mq += " ORDER BY part_no, serial_no NULLS LAST, id"
+            members = c.execute(mq, mp).fetchall()
             for m in members:
                 out.append({"flag_id": fl["flag_id"], "house": d.get("house"),
                            "constituency_no": d.get("constituency_no"), **m})

@@ -5,7 +5,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from auth import require_auth
-from dbx import db_ready
+from dbx import available_years, db_ready
 from fraud_rules import (RULES, record_review, reopen_flag, reviewed_flags,
                          reviewed_summary)
 from ui_helpers import (flag_card, flag_title, infinite_limit,
@@ -32,10 +32,19 @@ VERDICTS = {
     "needs_info": ("❓", "Needs more info"),
 }
 
+# ---------------------------------------------------------------- year scope
+years = available_years()
+if not years:
+    st.info("No rolls loaded yet — ingest data on the Ingest page first.")
+    st.stop()
+with st.sidebar:
+    st.header("Revision year")
+    year = st.selectbox("Data year", years, index=0)
+
 # ---------------------------------------------------------------- summary
-summary = reviewed_summary()
+summary = reviewed_summary(year)
 if not summary:
-    st.info("Nothing has been reviewed yet — adjudicate flags on the "
+    st.info(f"Nothing reviewed for {year} yet — adjudicate flags on the "
             "Fraud Review page first.")
     st.stop()
 
@@ -55,11 +64,11 @@ with st.sidebar:
     reviewer = st.text_input("Reviewer name", value="adi")
 
 # ---------------------------------------------------------------- list
-scroll_key = f"reviewed_pages::{verdict_filter}::{rule_filter}"
+scroll_key = f"reviewed_pages::{year}::{verdict_filter}::{rule_filter}"
 limit = infinite_limit(scroll_key)
 rows = reviewed_flags(None if verdict_filter == "(all)" else verdict_filter,
                       None if rule_filter == "(all)" else rule_filter,
-                      limit=limit + 1)
+                      limit=limit + 1, year=year)
 has_more = len(rows) > limit
 rows = rows[:limit]
 
@@ -82,7 +91,7 @@ for f in rows:
         st.caption(f"Verdict **{f['verdict']}** by **{f['reviewer']}** on "
                    f"{f['reviewed_at']:%Y-%m-%d %H:%M}"
                    + (f" — “{f['notes']}”" if f["notes"] else ""))
-        flag_card(f)
+        flag_card(f, year)
 
         notes = st.text_input("New notes (for re-adjudication)", key=f"rn{f['id']}")
         b1, b2, b3, b4 = st.columns(4)
