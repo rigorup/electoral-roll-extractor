@@ -244,13 +244,23 @@ def year_from_filename(name: str) -> int | None:
     return int(m.group(0)) if m else None
 
 
+_YEARS_SQL = ("SELECT DISTINCT year FROM voters WHERE year IS NOT NULL "
+              "ORDER BY year DESC")
+
+
 def available_years() -> list[int]:
-    """Years that actually have voters loaded, newest first."""
-    with connect() as c:
-        rows = c.execute(
-            "SELECT DISTINCT year FROM voters WHERE year IS NOT NULL "
-            "ORDER BY year DESC").fetchall()
-    return [r["year"] for r in rows]
+    """Years that actually have voters loaded, newest first.
+
+    The review pages call this before anything else touches the schema, so on a
+    database predating the year column the first call migrates and retries
+    rather than erroring the page."""
+    try:
+        with connect() as c:
+            return [r["year"] for r in c.execute(_YEARS_SQL).fetchall()]
+    except psycopg.errors.UndefinedColumn:
+        init_schema()
+        with connect() as c:
+            return [r["year"] for r in c.execute(_YEARS_SQL).fetchall()]
 
 
 def ingest_dataframe(df, source_file: str, photos: dict[str, bytes] | None = None,
