@@ -8,8 +8,9 @@ from dotenv import load_dotenv
 from auth import require_auth
 from dbx import available_years, db_ready
 from fraud_rules import (RULES, clear_flags, flag_counts_by_constituency,
-                         flag_summary, flagged_constituencies, open_flags,
-                         record_review, run_rules)
+                         flag_counts_by_constituency_rule, flag_summary,
+                         flagged_constituencies, open_flags, record_review,
+                         run_rules)
 from ui_helpers import (build_flags_pdf, build_flags_pdf_zip, flag_card,
                         flag_title, infinite_limit, infinite_scroll_sentinel)
 
@@ -92,6 +93,29 @@ with s2:
                    "counted once, under the first voter's AC.")
     else:
         st.caption("No constituency breakdown available.")
+
+# ---- model (rule) x constituency matrix
+st.subheader(f"Flags by model × constituency — {year}")
+mx = pd.DataFrame(flag_counts_by_constituency_rule(year))
+if mx.empty:
+    st.caption("No flags to break down yet.")
+else:
+    label = {r["constituency_no"]: (f"AC {r['constituency_no']} — "
+                                    f"{r['constituency_name']}"
+                                    if r["constituency_name"]
+                                    else f"AC {r['constituency_no']}")
+             for r in flag_counts_by_constituency(year)}
+    piv = (mx.pivot_table(index="constituency_no", columns="rule",
+                          values="flags", aggfunc="sum", fill_value=0)
+             .reindex(columns=list(RULES), fill_value=0))     # stable rule order
+    piv.insert(0, "TOTAL", piv.sum(axis=1))
+    piv.loc["ALL ACs"] = piv.sum(axis=0)                      # column totals
+    piv.index = [label.get(i, i) for i in piv.index]
+    piv.index.name = "Constituency"
+    st.dataframe(piv, use_container_width=True)
+    st.caption("Rows are constituencies (last row = all ACs), columns are "
+               "detection models. TOTAL is that constituency's flags across "
+               "every model.")
 
 # ---------------------------------------------------------------- queue
 st.divider()

@@ -391,6 +391,29 @@ def flag_counts_by_constituency(year: int | None = None,
         return c.execute(q, params).fetchall()
 
 
+def flag_counts_by_constituency_rule(year: int | None = None):
+    """Flags per (constituency, rule) — the long form behind the
+    model-by-constituency matrix. Same attribution as
+    flag_counts_by_constituency: the flag counts under voter A's AC."""
+    q = """
+        SELECT coalesce(nullif(va.constituency_no, ''), '(unknown)')
+                   AS constituency_no,
+               max(va.constituency_name) AS constituency_name,
+               f.rule                    AS rule,
+               count(DISTINCT f.id)      AS flags
+        FROM flags f
+        JOIN voters va ON va.id = f.voter_id
+        WHERE TRUE
+    """
+    params: list = []
+    if year is not None:
+        q += " AND va.year = %s"
+        params.append(int(year))
+    q += " GROUP BY 1, f.rule ORDER BY 1, f.rule"
+    with connect() as c:
+        return c.execute(q, params).fetchall()
+
+
 def flagged_constituencies(year: int | None = None,
                            rule: str | None = None) -> list[str]:
     """Constituency numbers that actually have flags — drives the per-AC
