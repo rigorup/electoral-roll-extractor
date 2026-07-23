@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 
 import psycopg
 from psycopg.rows import dict_row
@@ -221,10 +223,47 @@ CREATE TABLE IF NOT EXISTS app_settings (
 """
 
 
-def init_schema() -> None:
-    with connect() as c:
-        c.execute(SCHEMA)
-        c.commit()
+# init_schema() is called on every page load, so with concurrent sessions two
+# processes can start ALTER TABLE / CREATE INDEX on the same tables at once
+# and deadlock. An advisory lock serialises DDL across sessions/processes; the
+# in-process flag skips the round-trip entirely once schema is confirmed
+# current (Streamlit keeps this module's globals alive across reruns).
+_SCHEMA_LOCK_ID = 727100  # arbitrary constant, must match across the app
+_schema_guard = threading.Lock()
+_schema_ready = False
+
+
+def init_schema(force: bool = False) -> None:
+    """Apply the schema: once per process, and one caller at a time.
+
+    `pg_advisory_xact_lock` is released when the transaction ends, so a session
+    that dies mid-migration cannot strand the lock — and there is no unlock
+    call to fail on an already-aborted transaction. `lock_timeout` stops us
+    queueing forever behind a long-running transaction; losing that race is
+    retried rather than surfaced as a crash on someone's page load.
+    """
+    global _schema_ready
+    if _schema_ready and not force:
+        return
+    with _schema_guard:
+        if _schema_ready and not force:
+            return
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                with connect() as c:
+                    c.execute("SET lock_timeout = '20s'")
+                    c.execute("SELECT pg_advisory_xact_lock(%s)",
+                              (_SCHEMA_LOCK_ID,))
+                    c.execute(SCHEMA)
+                    c.commit()
+                _schema_ready = True
+                return
+            except (psycopg.errors.DeadlockDetected,
+                    psycopg.errors.LockNotAvailable) as e:
+                last = e
+                time.sleep(0.5 * (attempt + 1))
+        raise last  # type: ignore[misc]
 
 
 # ------------------------------------------------------------ app settings
