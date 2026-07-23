@@ -31,6 +31,10 @@ DEFAULT_CONFIG = (
 )
 
 
+# Key under which the session config is stored in the database.
+SETTING_KEY = "eci_config"
+
+
 def config_path() -> Path:
     """Resolve config.json: env var -> project-local file -> original location."""
     env = os.getenv("EPIC_LOOKUP_CONFIG")
@@ -42,25 +46,72 @@ def config_path() -> Path:
     return Path(DEFAULT_CONFIG)
 
 
+def _from_db() -> str | None:
+    """Session config stored in the DB, if any. Import is local and guarded so
+    this module still works standalone, with no database."""
+    try:
+        from dbx import get_setting
+        return get_setting(SETTING_KEY)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def config_source() -> str:
+    """Where the config is coming from — shown in the UI so it's never a guess."""
+    if os.getenv("EPIC_LOOKUP_CONFIG_JSON"):
+        return "environment variable"
+    if _from_db():
+        return "database"
+    return f"file ({config_path()})"
+
+
 def load_config() -> dict:
+    """Resolution order: inline env JSON -> database -> config.json file.
+
+    The database is the useful one in a container: ERO tokens expire about
+    every 30h, and a stored config can be refreshed from the UI without a
+    rebuild or redeploy.
+    """
+    raw = os.getenv("EPIC_LOOKUP_CONFIG_JSON")
+    if raw:
+        return json.loads(raw)
+    stored = _from_db()
+    if stored:
+        return json.loads(stored)
     with open(config_path(), encoding="utf-8") as f:
         return json.load(f)
 
 
-def config_available() -> tuple[bool, str]:
-    """(usable, human message) — lets the UI explain itself before any lookup."""
-    p = config_path()
-    if not p.exists():
-        return False, f"config.json not found at {p}"
-    try:
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
-        return False, f"config.json is not valid JSON: {e}"
+def validate_config(cfg: dict) -> tuple[bool, str]:
+    """Shape-check a config dict without contacting ECI."""
+    if not isinstance(cfg, dict):
+        return False, "config must be a JSON object"
+    missing = [k for k in ("userAgent", "stateCd") if not cfg.get(k)]
+    if missing:
+        return False, f"missing required key(s): {', '.join(missing)}"
     sessions = cfg.get("sessions") or []
     if not sessions:
-        return False, "config.json has no sessions configured"
+        return False, "no sessions configured"
+    for i, s in enumerate(sessions):
+        gaps = [k for k in ("acNo", "token", "atkn_bnd", "rtkn_bnd") if not s.get(k)]
+        if gaps:
+            return False, f"session #{i + 1} missing: {', '.join(gaps)}"
     acs = ", ".join(str(s.get("acNo")) for s in sessions)
     return True, f"{len(sessions)} AC session(s) configured: {acs}"
+
+
+def config_available() -> tuple[bool, str]:
+    """(usable, human message) — lets the UI explain itself before any lookup."""
+    try:
+        cfg = load_config()
+    except FileNotFoundError:
+        return False, (f"no config found — nothing in the database, and no file "
+                       f"at {config_path()}")
+    except json.JSONDecodeError as e:
+        return False, f"config is not valid JSON: {e}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+    return validate_config(cfg)
 
 
 def configured_acs() -> list[int]:

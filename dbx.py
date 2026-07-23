@@ -208,6 +208,16 @@ CREATE TABLE IF NOT EXISTS epic_documents (
 );
 CREATE INDEX IF NOT EXISTS epic_documents_epic_idx  ON epic_documents (epic_no);
 CREATE INDEX IF NOT EXISTS epic_documents_phash_idx ON epic_documents (phash);
+
+-- Small key/value store for operational settings that must survive a redeploy
+-- and be editable from the UI. Holds the ECINET session config: those ERO
+-- tokens expire roughly every 30h, so keeping them here means a refresh is a
+-- paste into the app, not a rebuild.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
 """
 
 
@@ -215,6 +225,39 @@ def init_schema() -> None:
     with connect() as c:
         c.execute(SCHEMA)
         c.commit()
+
+
+# ------------------------------------------------------------ app settings
+def get_setting(key: str) -> str | None:
+    """Read one operational setting, or None. Never raises."""
+    try:
+        with connect() as c:
+            row = c.execute("SELECT value FROM app_settings WHERE key=%s",
+                            (key,)).fetchone()
+        return row["value"] if row else None
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        return None
+
+
+def set_setting(key: str, value: str) -> None:
+    init_schema()
+    with connect() as c:
+        c.execute(
+            """INSERT INTO app_settings (key, value) VALUES (%s,%s)
+               ON CONFLICT (key) DO UPDATE
+                 SET value = EXCLUDED.value, updated_at = now()""",
+            (key, value))
+        c.commit()
+
+
+def setting_updated_at(key: str):
+    try:
+        with connect() as c:
+            row = c.execute("SELECT updated_at FROM app_settings WHERE key=%s",
+                            (key,)).fetchone()
+        return row["updated_at"] if row else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------- normalise

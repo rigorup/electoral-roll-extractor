@@ -1,6 +1,8 @@
 """Fill verified ECINET enumeration details onto voters, keyed by EPIC number."""
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -8,7 +10,8 @@ from dotenv import load_dotenv
 import eci_client
 import epic_enrich
 from auth import require_auth
-from dbx import available_years, connect, db_ready, init_schema
+from dbx import (available_years, connect, db_ready, init_schema, set_setting,
+                 setting_updated_at)
 
 load_dotenv()
 
@@ -29,11 +32,46 @@ init_schema()
 ok_cfg, cfg_msg = eci_client.config_available()
 if ok_cfg:
     st.success(f"Database connected · ECINET sessions ready — {cfg_msg}")
+    st.caption(f"Session config loaded from **{eci_client.config_source()}**.")
 else:
     st.error(f"EPIC lookup not configured: {cfg_msg}")
-    st.caption("Point `EPIC_LOOKUP_CONFIG` at your config.json, or place one "
-               "beside the app. Each ERO token only sees its own AC and "
-               "expires roughly every 30 hours.")
+    st.caption("Paste your ERO session config below to enable lookups.")
+
+# ---------------------------------------------------- ECINET session tokens
+# ERO tokens expire roughly every 30h. Storing them in the database means a
+# refresh is a paste here — no rebuild, no redeploy, no container restart.
+with st.expander("🔑 ECINET session tokens" +
+                 ("" if ok_cfg else " — needs setting up"), expanded=not ok_cfg):
+    updated = setting_updated_at(eci_client.SETTING_KEY)
+    if updated:
+        stamp = updated.strftime("%Y-%m-%d %H:%M UTC")
+        st.caption(f"Stored in the database, last updated **{stamp}**. Tokens "
+                   "expire about 30 hours after they are issued.")
+    st.markdown(
+        "Paste the whole `config.json` from your `epic_lookup` folder. It needs "
+        "`userAgent`, `stateCd` and a `sessions` list, each with `acNo`, "
+        "`token`, `atkn_bnd` and `rtkn_bnd`. Each ERO token only sees its own "
+        "Assembly Constituency."
+    )
+    pasted = st.text_area("config.json", height=200, key="cfg_paste",
+                          placeholder='{"userAgent": "...", "stateCd": "S02", '
+                                      '"sessions": [...]}')
+    if st.button("Save tokens", disabled=not pasted.strip()):
+        try:
+            parsed = json.loads(pasted)
+        except json.JSONDecodeError as e:
+            st.error(f"That isn't valid JSON: {e}")
+        else:
+            good, msg = eci_client.validate_config(parsed)
+            if not good:
+                st.error(f"Config rejected: {msg}")
+            else:
+                set_setting(eci_client.SETTING_KEY, json.dumps(parsed))
+                st.success(f"Saved — {msg}. Reloading…")
+                st.rerun()
+
+if not ok_cfg:
+    st.stop()
 
 # ---------------------------------------------------------------- year scope
 years = available_years()
@@ -41,10 +79,16 @@ if not years:
     st.info("No data yet — ingest a roll first.")
     st.stop()
 
-with st.sidebar:
-    st.header("Revision year")
-    year = st.selectbox("Data year", years, index=0,
-                        help="Only voters in this year are enriched.")
+st.divider()
+yc1, yc2 = st.columns([1, 3])
+with yc1:
+    year = st.selectbox("📅 Revision year", years, index=0,
+                        help="Everything on this page — the pending counts and "
+                             "the batch itself — covers only this year.")
+with yc2:
+    st.caption(f"Counts and lookups below are scoped to **{year}**. Each "
+               "revision year is a separate dataset, so the same elector in "
+               "another year is enriched separately.")
 
 # ---------------------------------------------------------------- what's left
 summary = epic_enrich.pending_summary(year)
@@ -103,7 +147,7 @@ st.caption(f"This click will look up at most **{planned:,}** unique EPIC(s) — 
            "skipped, so nothing is fetched twice.")
 
 if st.button("🔎 Fetch & fill details", type="primary",
-             use_container_width=True, disabled=not ok_cfg or tot_p == 0):
+             use_container_width=True, disabled=tot_p == 0):
     status = st.status("Starting lookups…", expanded=True)
     bar = st.progress(0.0)
 
