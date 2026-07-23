@@ -7,3 +7,6 @@ __pycache__/
 scratchpad/
 .DS_Store
 CREDENTIALS_LOCAL.txt
+
+# ECINET session tokens — never commit these
+config.json

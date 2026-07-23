@@ -153,6 +153,61 @@ ALTER TABLE voters
 CREATE UNIQUE INDEX IF NOT EXISTS voters_year_ac_part_serial_epic_idx
     ON voters (year, constituency_no, part_no, serial_no, epic_no);
 CREATE INDEX IF NOT EXISTS voters_year_idx ON voters (year);
+
+-- ------------------------------------------------------- ECINET enrichment
+-- The roll PDF only carries what is printed on the page. The ERO-side ECINET
+-- record holds the verified enumeration details (DOB, mobile, parents, the
+-- exact part/serial) plus two document images. These columns are filled by the
+-- EPIC Enrichment page, one lookup per unique EPIC.
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS epic_lookup_status  TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS epic_lookup_at      TIMESTAMPTZ;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS epic_id             TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS lookup_ac_no        TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS lookup_officer      TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_name       TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_dob        TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_age        INT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS mobile_no           TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS father_or_guardian_name TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS mother_name         TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS spouse_name         TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_house_no   TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_part_no    TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS part_serial_no      TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS part_name           TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS ac_name             TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS category_type       TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS relation_type_code  TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS relation_epic       TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS relation_name_verified TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS district_cd         TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS state_cd            TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS survey_channel      TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS submitted_for_recommendation TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS enum_created_on     TEXT;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS enum_modified_on    TEXT;
+-- Sensitive: only written when the operator explicitly opts in.
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS aadhaar_ref_no      TEXT;
+
+CREATE INDEX IF NOT EXISTS voters_epic_lookup_idx
+    ON voters (epic_lookup_status);
+
+-- The two ECINET images (EF photo + enumeration form page 1). Keyed by EPIC,
+-- not voter_id: the same elector appears in several years/rows but the
+-- document is one file, so this stores exactly one copy per EPIC. phash is
+-- kept so these can feed the existing photo-reuse detection.
+CREATE TABLE IF NOT EXISTS epic_documents (
+    id         BIGSERIAL PRIMARY KEY,
+    epic_no    TEXT NOT NULL,
+    doc_type   TEXT NOT NULL,          -- 'photo' | 'sr_form'
+    image      BYTEA,
+    ext        TEXT,
+    phash      BIGINT,
+    fetched_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (epic_no, doc_type)
+);
+CREATE INDEX IF NOT EXISTS epic_documents_epic_idx  ON epic_documents (epic_no);
+CREATE INDEX IF NOT EXISTS epic_documents_phash_idx ON epic_documents (phash);
 """
 
 
