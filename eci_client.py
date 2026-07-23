@@ -247,6 +247,28 @@ def lookup(epic: str, cfg: dict | None = None) -> dict:
     return {"ok": False, "message": msg, "expired": bool(expired_acs)}
 
 
+def lookup_in_ac(epic: str, ac, cfg: dict | None = None) -> dict:
+    """Resolve an EPIC using only the session for a known AC.
+
+    Callers that already know which constituency a voter belongs to (batch
+    enrichment does) can skip the auto-routing loop and hit exactly one token.
+    That is one ECI call-pair instead of up to three, and — crucially — lets
+    per-AC workers run in parallel without ever touching each other's session.
+    Falls back to the full auto-routing lookup if that AC has no session.
+    """
+    cfg = cfg or load_config()
+    sess = find_session(cfg, ac)
+    if sess is None:
+        return lookup(epic, cfg)
+    res, expired = lookup_in_session(epic, cfg, sess)
+    if res:
+        return res
+    if expired:
+        return {"ok": False, "expired": True,
+                "message": f"AC {ac} token expired — paste a fresh token."}
+    return {"ok": False, "message": f"Not found in AC {ac}."}
+
+
 # --------------------------------------------------------------------- images
 def _sniff_ext(data: bytes) -> str:
     """ECI mislabels PNGs as image/jpeg, so trust the magic bytes instead."""

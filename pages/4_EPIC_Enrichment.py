@@ -131,20 +131,29 @@ with c2:
         help="EF photo + enumeration form page 1, stored in epic_documents "
              "(one copy per EPIC).")
     delay = st.number_input("Delay between lookups (sec)", 0.0, 5.0, 0.0,
-                            step=0.1, help="Be gentle with the live ECI API.")
+                            step=0.1, help="Per worker. Be gentle with the live "
+                                           "ECI API.")
     include_aadhaar = st.toggle(
         "Include Aadhaar reference", value=False,
         help="Sensitive personal data. Off by default.")
+
+n_target_acs = len(chosen or ac_options)
+workers = st.slider(
+    "Parallel constituencies (lookups at once)", 1, max(n_target_acs, 1),
+    min(3, n_target_acs) or 1,
+    help="One worker per constituency runs concurrently — 3 selected means 3 "
+         "lookups in flight at once. Within a constituency the calls stay "
+         "sequential, because that is one shared ERO token.")
 
 if include_aadhaar:
     st.warning("⚠️ Aadhaar reference numbers will be written into the voters "
                "table. Enable only if you are authorised to store them, and "
                "handle the database accordingly.")
 
-planned = min(tot_p, int(per_ac_cap) * len(chosen or ac_options))
+planned = min(tot_p, int(per_ac_cap) * n_target_acs)
 st.caption(f"This click will look up at most **{planned:,}** unique EPIC(s) — "
-           f"{per_ac_cap} per constituency. Rows already marked *Found* are "
-           "skipped, so nothing is fetched twice.")
+           f"{per_ac_cap} per constituency, **{workers}** at a time. Rows "
+           "already marked *Found* are skipped, so nothing is fetched twice.")
 
 if st.button("🔎 Fetch & fill details", type="primary",
              use_container_width=True, disabled=tot_p == 0):
@@ -152,8 +161,9 @@ if st.button("🔎 Fetch & fill details", type="primary",
     bar = st.progress(0.0)
 
     def progress(msg: str, frac: float | None = None):
+        # Only update the label + bar (called ~2×/sec): appending to the log
+        # every tick would bury the page in hundreds of lines.
         status.update(label=msg)
-        status.write(msg)
         if frac is not None:
             bar.progress(min(max(frac, 0.0), 1.0))
 
@@ -165,6 +175,7 @@ if st.button("🔎 Fetch & fill details", type="primary",
             include_images=include_images,
             include_aadhaar=include_aadhaar,
             delay=float(delay),
+            max_workers=int(workers),
             progress=progress,
         )
         status.update(label="Done.", state="complete", expanded=False)
@@ -186,7 +197,8 @@ if "epic_enrich_stats" in st.session_state:
     r4.metric("Images stored", stats["images_saved"])
 
     st.caption(f"{stats['api_calls']} API call(s) for {stats['unique_epics']} "
-               "unique EPIC(s) — duplicate rows share one lookup.")
+               f"unique EPIC(s) across {stats.get('workers', 1)} parallel "
+               "worker(s) — duplicate rows share one lookup.")
     if stats["per_ac"]:
         st.caption("Per AC this run: " + " · ".join(
             f"AC {k}: {v}" for k, v in sorted(stats["per_ac"].items())))

@@ -14,13 +14,19 @@ Design rules:
   button can be clicked repeatedly and only fills what is still missing.
 * **Per-AC cap.** At most `per_ac_cap` unique EPICs per constituency per run
   (default 100), so one click cannot pull an entire roll.
-* **Sequential.** One request at a time — this is a live government API
-  holding real PII.
-* **Expired tokens stop the run** instead of being retried row after row.
+* **Parallel across constituencies.** Each AC has its own ERO token and its own
+  slice of EPICs, so one worker per AC runs them concurrently — three selected
+  constituencies means three lookups in flight at once. Within an AC the calls
+  stay sequential, because that is one shared government token.
+* **Expired tokens stop that AC** instead of being retried row after row; other
+  constituencies keep going.
 """
 from __future__ import annotations
 
+import threading
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import eci_client
@@ -185,6 +191,65 @@ def _mark(c, epic: str, status: str) -> int:
         "WHERE epic_no=%s", (status, epic)).rowcount
 
 
+def _enrich_one_ac(ac: str, epics: list[str], cfg: dict, *,
+                   include_images: bool, include_aadhaar: bool, delay: float,
+                   stats: dict, lock: threading.Lock, counter: dict) -> None:
+    """Process every pending EPIC for a single constituency, sequentially.
+
+    Runs on its own thread with its own DB connection and only ever touches
+    this AC's token, so parallel workers never contend. All writes to the
+    shared `stats`/`counter` go through `lock`.
+    """
+    with connect() as c:
+        for epic in epics:
+            try:
+                res = eci_client.lookup_in_ac(epic, ac, cfg)
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    stats["errors"] += _mark(c, epic, STATUS_ERROR)
+                    stats["messages"].append(f"{epic}: {e}")
+                    counter["done"] += 1
+                c.commit()
+                continue
+
+            with lock:
+                stats["api_calls"] += 1
+
+            if res.get("ok"):
+                saved, errs = (0, [])
+                if include_images:
+                    saved, errs = _store_images(c, epic, res)
+                updated = _apply(c, epic, res, include_aadhaar)
+                c.commit()
+                with lock:
+                    stats["images_saved"] += saved
+                    stats["image_errors"].extend(errs)
+                    stats["rows_updated"] += updated
+                    stats["found"] += 1
+                    stats["per_ac"][ac] = stats["per_ac"].get(ac, 0) + 1
+                    counter["done"] += 1
+            elif res.get("expired"):
+                _mark(c, epic, STATUS_EXPIRED)
+                c.commit()
+                with lock:
+                    stats["errors"] += 1
+                    stats["messages"].append(res.get("message", "token expired"))
+                    stats["expired_acs"].add(ac)
+                    counter["done"] += 1
+                # This AC's token is dead — every remaining EPIC here fails the
+                # same way. Stop this worker; other constituencies continue.
+                return
+            else:
+                _mark(c, epic, STATUS_NOT_FOUND)
+                c.commit()
+                with lock:
+                    stats["not_found"] += 1
+                    counter["done"] += 1
+
+            if delay:
+                time.sleep(delay)
+
+
 def enrich_pending(
     *,
     year: int | None = None,
@@ -193,9 +258,14 @@ def enrich_pending(
     include_images: bool = True,
     include_aadhaar: bool = False,
     delay: float = 0.0,
+    max_workers: int | None = None,
     progress: Progress | None = None,
 ) -> dict:
-    """Fill outstanding voters. Returns a stats dict for the UI."""
+    """Fill outstanding voters, running constituencies in parallel.
+
+    One worker thread per AC (up to `max_workers`), so N selected
+    constituencies do N lookups at once. Returns a stats dict for the UI.
+    """
     progress = progress or (lambda msg, frac=None: None)
     init_schema()
 
@@ -203,56 +273,60 @@ def enrich_pending(
         "unique_epics": 0, "rows_updated": 0, "api_calls": 0,
         "found": 0, "not_found": 0, "errors": 0,
         "images_saved": 0, "image_errors": [], "messages": [],
-        "per_ac": {}, "stopped_early": False,
+        "per_ac": {}, "expired_acs": set(), "stopped_early": False,
+        "workers": 0,
     }
 
     with connect() as c:
         targets = _select_pending(c, year, acs, per_ac_cap)
-        stats["unique_epics"] = len(targets)
-        if not targets:
-            progress("Nothing pending — every EPIC is already filled.", 1.0)
-            return stats
 
-        total = len(targets)
-        for n, row in enumerate(targets, start=1):
-            epic, ac = row["epic_no"], row["constituency_no"]
-            progress(f"[{n}/{total}] AC {ac} · {epic} …", n / total)
+    stats["unique_epics"] = len(targets)
+    if not targets:
+        progress("Nothing pending — every EPIC is already filled.", 1.0)
+        stats["expired_acs"] = []
+        return stats
 
-            try:
-                res = eci_client.lookup(epic)
-                stats["api_calls"] += 1
-            except Exception as e:  # noqa: BLE001
-                stats["errors"] += _mark(c, epic, STATUS_ERROR)
-                stats["messages"].append(f"{epic}: {e}")
-                c.commit()
-                continue
+    # Partition the work by constituency: one bucket per AC, each run by a
+    # single worker so a shared token is never hit concurrently.
+    by_ac: dict[str, list[str]] = defaultdict(list)
+    for row in targets:
+        by_ac[row["constituency_no"]].append(row["epic_no"])
 
-            if res.get("ok"):
-                if include_images:
-                    saved, errs = _store_images(c, epic, res)
-                    stats["images_saved"] += saved
-                    stats["image_errors"].extend(errs)
-                updated = _apply(c, epic, res, include_aadhaar)
-                stats["rows_updated"] += updated
-                stats["found"] += 1
-                stats["per_ac"][ac] = stats["per_ac"].get(ac, 0) + 1
-            elif res.get("expired"):
-                stats["errors"] += 1
-                stats["messages"].append(res.get("message", "token expired"))
-                _mark(c, epic, STATUS_EXPIRED)
-                # Every remaining call would fail the same way.
-                if "All tokens expired" in str(res.get("message")):
-                    stats["stopped_early"] = True
-                    c.commit()
-                    progress("All tokens expired — stopped.", 1.0)
-                    break
-            else:
-                _mark(c, epic, STATUS_NOT_FOUND)
-                stats["not_found"] += 1
+    cfg = eci_client.load_config()
+    lock = threading.Lock()
+    counter = {"done": 0, "total": len(targets)}
+    workers = min(max_workers or len(by_ac), len(by_ac))
+    stats["workers"] = workers
 
-            c.commit()          # commit per EPIC: a mid-run stop loses nothing
-            if delay:
-                time.sleep(delay)
+    progress(f"0/{counter['total']} — {len(by_ac)} constituencies, "
+             f"{workers} in parallel…", 0.0)
 
-    progress("Enrichment complete.", 1.0)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [
+            ex.submit(_enrich_one_ac, ac, epics, cfg,
+                      include_images=include_images,
+                      include_aadhaar=include_aadhaar, delay=delay,
+                      stats=stats, lock=lock, counter=counter)
+            for ac, epics in by_ac.items()
+        ]
+        # Poll from THIS (main) thread so every Streamlit UI call stays on the
+        # script thread — worker threads only touch shared counters.
+        while any(not f.done() for f in futures):
+            with lock:
+                done = counter["done"]
+                acs_live = ", ".join(f"AC {a}:{n}" for a, n in
+                                     sorted(stats["per_ac"].items()))
+            progress(f"{done}/{counter['total']} filled so far"
+                     + (f" — {acs_live}" if acs_live else "") + " …",
+                     done / counter["total"])
+            time.sleep(0.4)
+        for f in futures:
+            f.result()  # re-raise any worker exception
+
+    # All workers whose token expired -> nothing more can be done this run.
+    if stats["expired_acs"] and stats["expired_acs"] >= set(by_ac):
+        stats["stopped_early"] = True
+    stats["expired_acs"] = sorted(stats["expired_acs"])
+    progress(f"Done — {stats['found']} filled, {stats['not_found']} not found.",
+             1.0)
     return stats
