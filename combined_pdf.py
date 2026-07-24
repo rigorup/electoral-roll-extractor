@@ -423,9 +423,11 @@ def _dups_section(flow: Flow, rec: dict, comprehensive: bool):
 # ---------------------------------------------------------------- comprehensive
 def build_comprehensive_pdf(records: list[dict], year: int,
                             scope_label: str = "all constituencies",
-                            with_photo: bool = True) -> bytes:
+                            with_photo: bool = True,
+                            start_index: int = 1) -> bytes:
     """Facility 1 — the full report of every qualifying voter and every reason,
-    method and duplicate-comparison, in priority order."""
+    method and duplicate-comparison, in priority order. `start_index` continues
+    the running voter number across chunked parts."""
     flow = Flow(f"Combined Model — comprehensive report — {year} — {scope_label}")
     flow.para(f"{len(records)} voter(s) with at least one signal, ordered "
               f"highest-possibility first (fuzzy/cosine duplicate leads, then "
@@ -435,7 +437,7 @@ def build_comprehensive_pdf(records: list[dict], year: int,
 
     photos = roll_photos([r["voter_id"] for r in records]) if with_photo else {}
 
-    for idx, rec in enumerate(records, 1):
+    for idx, rec in enumerate(records, start_index):
         _voter_header(flow, rec, idx)
         if with_photo:
             ph = photos.get(rec["voter_id"])
@@ -570,10 +572,12 @@ def build_dossier_pdf(records: list[dict], year: int,
     return flow.bytes()
 
 
-def build_dossier_zip(records: list[dict], year: int, per_file: int = 40,
+def build_dossier_zip(records: list[dict], year: int, per_file: int = 50,
                       scope_label: str = "", progress=None) -> bytes:
     """Split the dossier across numbered PDFs (part 01 = strongest leads), so no
-    single file becomes too large to open. Returns a ZIP of the parts."""
+    single file becomes too large to open. At most `per_file` voters per PDF
+    (capped at 50). Returns a ZIP of the parts."""
+    per_file = max(1, min(int(per_file), 50))
     buf = io.BytesIO()
     n = len(records)
     parts = max(1, (n + per_file - 1) // per_file)
@@ -603,4 +607,31 @@ def build_comprehensive_zip(records_by_ac: dict[str, list[dict]], year: int,
             safe = str(ac).replace("/", "-").replace(" ", "")
             z.writestr(f"combined_{year}_AC{safe}.pdf",
                        build_comprehensive_pdf(recs, year, scope_label=f"AC {ac}"))
+    return buf.getvalue()
+
+
+def build_comprehensive_zip_chunked(records: list[dict], year: int,
+                                    per_file: int = 50,
+                                    scope_label: str = "all constituencies",
+                                    progress=None) -> bytes:
+    """Split the comprehensive report across numbered PDFs of at most `per_file`
+    voters each (capped at 50; part 01 = strongest leads), so no single file is
+    too large to download or open. Voters stay in the same priority order across
+    parts and keep a continuous rank number. Returns a ZIP of the parts."""
+    per_file = max(1, min(int(per_file), 50))
+    buf = io.BytesIO()
+    n = len(records)
+    parts = max(1, (n + per_file - 1) // per_file)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in range(parts):
+            chunk = records[p * per_file:(p + 1) * per_file]
+            if progress:
+                progress(p + 1, parts, len(chunk))
+            lo = p * per_file + 1
+            hi = p * per_file + len(chunk)
+            label = f"{scope_label} — part {p + 1}/{parts} (rank {lo}-{hi})"
+            pdf = build_comprehensive_pdf(chunk, year, scope_label=label,
+                                          start_index=lo)
+            z.writestr(
+                f"comprehensive_part{p + 1:02d}_rank{lo:05d}-{hi:05d}.pdf", pdf)
     return buf.getvalue()

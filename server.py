@@ -918,17 +918,19 @@ async def api_reports_flags_zip(
     return _zip_response(data, f"fraud_flags_{year}_by_constituency.zip")
 
 
-@app.get("/api/reports/combined_comprehensive.pdf")
+@app.get("/api/reports/combined_comprehensive.zip")
 async def api_reports_combined_comprehensive(
     year: int,
     ac: str | None = None,
     top: int | None = None,
+    per_file: int = 50,
     user: str = Depends(webauth.require_auth),
 ):
     records = _cached_records(year)  # 409 if not built
+    per_file = max(1, min(per_file, 50))  # at most 50 voters per PDF
 
     def work():
-        from combined_pdf import build_comprehensive_pdf
+        from combined_pdf import build_comprehensive_zip_chunked
         recs = records
         if ac:
             recs = [r for r in recs if (r.get("constituency_no") or "") == ac]
@@ -938,10 +940,11 @@ async def api_reports_combined_comprehensive(
             scope = f"top {top}"
         else:
             scope = "all constituencies"
-        return build_comprehensive_pdf(recs, year, scope_label=scope)
+        return build_comprehensive_zip_chunked(
+            recs, year, per_file=per_file, scope_label=scope)
 
     data = await db_call(work)
-    return _pdf_response(data, f"combined_comprehensive_{year}_{ac or 'all'}.pdf")
+    return _zip_response(data, f"combined_comprehensive_{year}_{ac or 'all'}.zip")
 
 
 @app.get("/api/reports/combined_dossier.zip")
@@ -949,10 +952,11 @@ async def api_reports_combined_dossier(
     year: int,
     ac: str | None = None,
     count: int | None = None,
-    per_file: int = 40,
+    per_file: int = 50,
     user: str = Depends(webauth.require_auth),
 ):
     records = _cached_records(year)  # 409 if not built
+    per_file = max(1, min(per_file, 50))  # at most 50 voters per PDF
 
     def work():
         from combined_pdf import build_dossier_zip

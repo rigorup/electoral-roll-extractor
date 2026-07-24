@@ -1314,9 +1314,9 @@ async function viewReports(view) {
       () => download(url('/api/reports/flags.pdf'))),
     reportCard('Fraud flags — ZIP', 'Per-constituency flag PDFs bundled into a ZIP archive.',
       () => download(url('/api/reports/flags.zip'))),
-    reportCard('Combined comprehensive — PDF', 'Full comprehensive dossier from the built suspect model (build suspects first).',
-      () => download(url('/api/reports/combined_comprehensive.pdf', { top: topInput.value }))),
-    reportCard('Combined dossier — ZIP', 'Per-suspect dossier PDFs zipped (from the built suspect model).',
+    reportCard('Combined comprehensive — ZIP', 'Comprehensive report split into PDFs of ≤50 suspects each, zipped (build suspects first).',
+      () => download(url('/api/reports/combined_comprehensive.zip', { top: topInput.value }))),
+    reportCard('Combined dossier — ZIP', 'Per-suspect dossier PDFs, ≤50 suspects per PDF, zipped (from the built suspect model).',
       () => download(url('/api/reports/combined_dossier.zip', { count: topInput.value }))),
   ));
   view.appendChild(el('div', { class: 'small dim mt' }, 'Combined reports require suspects to be built for this year. Downloads open in a new tab.'));
