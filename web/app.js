@@ -223,6 +223,7 @@ function renderLogin(errMsg) {
 const NAV = [
   { hash: '#/overview', label: 'Overview', ico: '⌂' },
   { hash: '#/suspects', label: 'Suspects', ico: '⚑' },
+  { hash: '#/combined', label: 'Combined Model', ico: '🧬' },
   { hash: '#/review', label: 'Review Queue', ico: '☑' },
   { hash: '#/explore', label: 'Explore', ico: '⌕' },
   { hash: '#/reviewed', label: 'Reviewed', ico: '✓' },
@@ -332,6 +333,7 @@ function parseHash() {
 const ROUTES = {
   '/overview': viewOverview,
   '/suspects': viewSuspects,
+  '/combined': viewCombined,
   '/review': viewReview,
   '/explore': viewExplore,
   '/reviewed': viewReviewed,
@@ -1290,36 +1292,33 @@ async function viewEnrich(view) {
    6h. REPORTS
    ========================================================================== */
 async function viewReports(view) {
-  view.appendChild(viewHead('Reports', 'Generate & download PDF / ZIP reports for the current year', []));
+  view.appendChild(viewHead('Reports', 'Generate & download fraud-flag PDF / ZIP reports for the current year', []));
   if (!requireYear(view)) return;
   const rules = await loadRules();
 
   const ruleSel = selectEl([{ value: '', label: 'All rules' }].concat(rules.map(r => ({ value: r.id, label: r.id }))), '', null);
   const acInput = el('input', { type: 'text', placeholder: 'AC (blank = all)', style: 'width:150px' });
-  const topInput = el('input', { type: 'number', placeholder: 'top N', style: 'width:100px' });
 
-  const url = (base, extra) => {
+  const url = (base) => {
     const p = new URLSearchParams({ year: state.year });
     if (ruleSel.value) p.set('rule', ruleSel.value);
     if (acInput.value.trim()) p.set('ac', acInput.value.trim());
-    if (extra) for (const [k, v] of Object.entries(extra)) if (v) p.set(k, v);
     return base + '?' + p.toString();
   };
 
   view.appendChild(el('div', { class: 'panel pad mb wrap-flex' },
-    field('Rule', ruleSel), field('Constituency', acInput), field('Top N (combined)', topInput)));
+    field('Rule', ruleSel), field('Constituency', acInput)));
 
   view.appendChild(el('div', { class: 'grid cols-2' },
     reportCard('Fraud flags — PDF', 'All open flags for the selected rule/AC, formatted as a PDF report.',
       () => download(url('/api/reports/flags.pdf'))),
     reportCard('Fraud flags — ZIP', 'Per-constituency flag PDFs bundled into a ZIP archive.',
       () => download(url('/api/reports/flags.zip'))),
-    reportCard('Combined comprehensive — ZIP', 'Comprehensive report split into PDFs of ≤50 suspects each, zipped (build suspects first).',
-      () => download(url('/api/reports/combined_comprehensive.zip', { top: topInput.value }))),
-    reportCard('Combined dossier — ZIP', 'Per-suspect dossier PDFs, ≤50 suspects per PDF, zipped (from the built suspect model).',
-      () => download(url('/api/reports/combined_dossier.zip', { count: topInput.value }))),
   ));
-  view.appendChild(el('div', { class: 'small dim mt' }, 'Combined reports require suspects to be built for this year. Downloads open in a new tab.'));
+  view.appendChild(el('div', { class: 'small dim mt' },
+    el('span', {}, 'Combined-model reports (comprehensive report + per-voter dossier, ≤50 voters/PDF) now live in the '),
+    el('a', { href: '#/combined' }, 'Combined Model tab →'),
+    el('span', {}, '  Downloads open in a new tab.')));
 }
 
 function reportCard(title, desc, onClick) {
@@ -1327,6 +1326,73 @@ function reportCard(title, desc, onClick) {
     el('div', { style: 'font-weight:700;font-size:15px;margin-bottom:5px' }, title),
     el('div', { class: 'small dim', style: 'margin-bottom:12px' }, desc),
     el('button', { class: 'btn primary', onclick: onClick }, '⎙ Download'));
+}
+
+/* ============================================================================
+   6i. COMBINED MODEL — dedicated tab: build once, then export the two
+   ≤50-voter PDF facilities (comprehensive report + per-voter dossier).
+   ========================================================================== */
+async function viewCombined(view) {
+  view.appendChild(viewHead('Combined Model',
+    'Four doubt signals fused per voter — logical discrepancy · no category mapping · cosine_new · fuzzy_new. Build once, then export the ≤50-voter PDF reports below.',
+    [el('button', { class: 'btn', onclick: () => rebuildSuspects(view) }, '↻ Rebuild model')]));
+  if (!requireYear(view)) return;
+
+  const host = el('div', {});
+  view.appendChild(host);
+  host.appendChild(loadingRow('Checking combined-model cache…'));
+
+  let summary;
+  try { summary = await api('/api/suspects/summary?year=' + encodeURIComponent(state.year)); }
+  catch (e) { clear(host); host.appendChild(emptyState('⚠', 'Could not load', e.detail || e.message)); return; }
+
+  clear(host);
+  if (!summary.built) {
+    host.appendChild(emptyState('🧬', 'Combined model not built yet',
+      'Build the combined model for ' + state.year + ' to fuse the four signals per voter, then export the comprehensive report and per-voter dossiers.',
+      el('button', { class: 'btn primary', onclick: () => rebuildSuspects(view) }, '🧬 Build combined model')));
+    return;
+  }
+
+  // summary strip
+  const s = summary.summary || {};
+  host.appendChild(el('div', { class: 'grid cols-4 mb' },
+    statCard('Flagged voters', s.total, 'accent', 'built ' + (summary.built_at ? new Date(summary.built_at).toLocaleString() : '')),
+    statCard('High', s.high || 0, 'high'),
+    statCard('Medium', s.medium || 0, 'medium'),
+    statCard('Low', s.low || 0, 'low'),
+  ));
+
+  // shared scope controls
+  const acOptions = [{ value: '', label: 'All constituencies' }].concat((summary.constituencies || []).map(a => ({ value: a, label: 'AC ' + a })));
+  const acSel = selectEl(acOptions, '', null, {});
+  const topInput = el('input', { type: 'number', min: '1', placeholder: 'all in scope', style: 'width:130px' });
+
+  host.appendChild(el('div', { class: 'panel pad mb wrap-flex' },
+    field('Constituency', acSel),
+    field('Top-N voters (blank = all)', topInput),
+    el('div', { class: 'small dim', style: 'align-self:center;max-width:340px' },
+      'Priority order: fuzzy/cosine duplicates → logical discrepancy → no-mapping. Every export is split into PDFs of at most 50 voters (part 01 = strongest leads).')));
+
+  const dl = (base, topKey) => {
+    const p = new URLSearchParams({ year: state.year });
+    if (acSel.value) p.set('ac', acSel.value);
+    if (topInput.value) p.set(topKey, topInput.value);
+    return base + '?' + p.toString();
+  };
+
+  host.appendChild(el('div', { class: 'grid cols-2' },
+    reportCard('Facility 1 — Comprehensive report (ZIP)',
+      'Every flagged voter with all findings, methods, reasons and the full duplicate-comparison logic, in priority order. Split into PDFs of ≤50 voters.',
+      () => download(dl('/api/reports/combined_comprehensive.zip', 'top'))),
+    reportCard('Facility 2 — Full dossier (ZIP)',
+      'A complete case file per voter — every stored data point, every photo, and the EF form rendered large — plus the same full record for each cosine/fuzzy duplicate. Split into PDFs of ≤50 voters.',
+      () => download(dl('/api/reports/combined_dossier.zip', 'count'))),
+  ));
+
+  host.appendChild(el('div', { class: 'small dim mt' },
+    el('span', {}, 'Names come from the ECINET verified record. A flag is a lead, not a verdict. '),
+    el('a', { href: '#/suspects' }, 'Browse the full suspect list →')));
 }
 
 /* ------------------------------------------------------------------ *
