@@ -51,7 +51,7 @@ with st.sidebar:
     st.header("Signals covered")
     st.caption("**Logical discrepancy** — progeny ≥ 6 · father-name conflict · "
                "parent age gap < 15 or > 50 · grandparent age gap ≤ 40 · "
-               "roll-age vs DOB-age gap > 2.")
+               "roll-age vs DOB-age gap > 5.")
     st.caption("**No mapping** — ECINET `category_type = 'na'`.")
     st.caption("**cosine_new / fuzzy_new** — the existing duplicate models "
                "(read from their flags).")
@@ -124,7 +124,7 @@ if summ["by_check"]:
     label = {
         "progeny_overload": "Progeny ≥ 6", "father_name_conflict": "Father-name conflict",
         "parent_age_under_15": "Parent gap < 15", "parent_age_over_50": "Parent gap > 50",
-        "grandparent_age_le_40": "Grandparent gap ≤ 40", "age_dob_gap": "Roll-age vs DOB-age > 2",
+        "grandparent_age_le_40": "Grandparent gap ≤ 40", "age_dob_gap": "Roll-age vs DOB-age > 5",
     }
     bc = pd.DataFrame([{"Logical check": label.get(k, k), "Voters": v}
                        for k, v in sorted(summ["by_check"].items(),

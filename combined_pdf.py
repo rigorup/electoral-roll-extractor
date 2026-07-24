@@ -70,7 +70,7 @@ _CHECK_LABEL = {
     "parent_age_under_15": "Parent age gap < 15",
     "parent_age_over_50": "Parent age gap > 50",
     "grandparent_age_le_40": "Grandparent age gap <= 40",
-    "age_dob_gap": "Roll-age vs DOB-age gap > 2",
+    "age_dob_gap": "Roll-age vs DOB-age gap > 5",
 }
 
 

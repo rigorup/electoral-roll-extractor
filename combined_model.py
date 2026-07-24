@@ -11,7 +11,7 @@ of them fires, the voter enters the report with a full, itemised explanation of
        3. parent_age_under_15  — a resolved parent < 15 years older than the child
        4. parent_age_over_50   — a resolved parent > 50 years older than the child
        5. grandparent_age_le_40 — a resolved grandparent <= 40 years older
-       6. age_dob_gap          — |roll age - age from verified DOB| > 2 years
+       6. age_dob_gap          — |roll age - age from verified DOB| > 5 years
   b. No mapping in categories — the ECINET category_type is 'na' (the voter
      could not be mapped to a self or progeny SIR entry).
   c. cosine_new duplicate — the voter is on either side of a cosine_new flag.
@@ -45,7 +45,7 @@ PROGENY_MAX          = 6      # a reference with >= this many progeny is flagged
 PARENT_MIN_GAP       = 15     # a parent < this many years older -> impossible
 PARENT_MAX_GAP       = 50     # a parent > this many years older -> suspicious
 GRANDPARENT_MAX_GAP  = 40     # a grandparent <= this many years older -> impossible
-DOB_AGE_GAP_MAX      = 2      # roll age vs DOB-age may differ by at most this
+DOB_AGE_GAP_MAX      = 5      # roll age vs DOB-age may differ by at most this
 NO_MAPPING_CATEGORY  = "na"   # ECINET category_type meaning 'not mapped'
 
 _PARENT_CODES = {"FTHR", "MTHR", "FATHER", "MOTHER", "F", "M"}
