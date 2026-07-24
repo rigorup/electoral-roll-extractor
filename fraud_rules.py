@@ -747,6 +747,224 @@ def _run_fuzzy_new(c, year: int) -> None:
             )
 
 
+# =====================================================================
+# cosine_new — TF-weighted trigram-vector cosine over the verified record,
+#              category and demographics, with a side-by-side comparison
+# =====================================================================
+# Where fuzzy_new averages per-attribute similarities, cosine_new is the cosine
+# counterpart (the cosine_dup idea, extended): it builds ONE TF-weighted
+# trigram VECTOR per voter from all their fields — verified name, verified DOB,
+# father, mother, spouse, the ECINET CATEGORY (self / progeny / na) and relation
+# type, progeny/relation EPIC, house, gender — and scores a pair by the cosine
+# between the two vectors. Cosine is frequency-aware and magnitude-normalised,
+# so it ranks pairs differently from the fuzzy average.
+#
+# The voter name comes from the ECINET verified_name (roll name as fallback).
+# Category is a light corroborator (only 3 values), never an anchor. As with
+# fuzzy_new, a flag needs a real identity anchor (real DOB / progeny-EPIC /
+# parent-name match) and stores a side-by-side {attribute, a, b, similarity,
+# status} comparison of every field checked, for the comparison PDF.
+COSINE_NEW_THRESHOLD  = 0.80  # combined-profile cosine needed to raise a flag
+COSINE_NEW_HIGH       = 0.90  # >= this -> 'high' severity
+COSINE_NEW_MIN_ATTRS  = 3
+# A duplicate is the SAME person, so the verified names must actually match.
+# Without this floor the combined-vector cosine stays high whenever the other
+# demographics agree, flagging siblings / same-DOB strangers whose names differ.
+COSINE_NEW_NAME_FLOOR = 0.85
+
+# Field weights for the combined profile vector (each field's trigram counts are
+# scaled by its weight before summing). Name and DOB dominate.
+_CN_VEC_W = {
+    "name": 3.0, "dob": 2.0, "father": 1.5, "mother": 1.2, "spouse": 0.8,
+    "progeny_epic": 0.6, "house": 0.5, "category": 0.5, "relation_type": 0.4,
+    "gender": 0.3,
+}
+_CN_COLS = (
+    "id, epic_no, name, verified_name, gender, age, verified_age, "
+    "verified_dob, relation_type, relation_name, relation_name_verified, "
+    "relation_epic, relation_type_code, category_type, "
+    "father_or_guardian_name, mother_name, spouse_name, "
+    "house_number, house_norm, constituency_no"
+)
+
+
+def _cn_fields(v: dict) -> dict:
+    """The per-field normalised strings that make up a voter's profile."""
+    an, _ = _nm1_name(v)
+    return {
+        "name": norm_name(an),
+        "dob": (v.get("verified_dob") or "").strip(),
+        "father": norm_name(v.get("father_or_guardian_name")),
+        "mother": norm_name(v.get("mother_name")),
+        "spouse": norm_name(v.get("spouse_name")),
+        "progeny_epic": (v.get("relation_epic") or "").strip().upper(),
+        "house": v.get("house_norm") or "",
+        "category": (v.get("category_type") or "").strip().upper(),
+        "relation_type": (v.get("relation_type_code") or "").strip().upper(),
+        "gender": (v.get("gender") or "").strip().upper()[:1],
+    }
+
+
+def _cn_vec(fields: dict) -> "Counter[str]":
+    """Weighted sum of the fields' trigram counters. Each field is name-spaced
+    (`field:value`) so trigrams from different fields never collide — the cosine
+    then measures agreement field-by-field, weighted."""
+    vec: "Counter[str]" = Counter()
+    for f, w in _CN_VEC_W.items():
+        s = fields.get(f) or ""
+        if not s:
+            continue
+        for tri, cnt in _trigrams(f"{f}:{s}").items():
+            vec[tri] += cnt * w
+    return vec
+
+
+def _cn_score(a: dict, b: dict, va: "Counter[str]", vb: "Counter[str]"
+              ) -> tuple[float, list[dict], int]:
+    """Cosine of the two (pre-built) profile vectors, plus the per-attribute
+    side-by-side comparison and the count of comparable attributes. Vectors are
+    passed in so the caller can build each voter's vector once, not per pair."""
+    composite = _cosine(va, vb)
+    comp: list[dict] = []
+    n = 0
+
+    def use(label: str, sim: float | None, va, vb):
+        nonlocal n
+        comp.append({"attribute": label, "a": va, "b": vb,
+                     "similarity": None if sim is None else round(sim, 3),
+                     "status": _fn_status(sim)})
+        if sim is not None:
+            n += 1
+
+    an, _ = _nm1_name(a)
+    bn, _ = _nm1_name(b)
+    use("Verified name", _fn_sim(an, bn), an or None, bn or None)
+
+    da = (a.get("verified_dob") or "").strip()
+    db_ = (b.get("verified_dob") or "").strip()
+    dsim = None
+    if da and db_:
+        dsim = ((0.6 if _nm1_is_placeholder_dob(da) else 1.0) if da == db_
+                else (0.5 if da[:4] == db_[:4] else 0.0))
+    use("Date of birth", dsim, da or None, db_ or None)
+
+    use("Father / guardian",
+        _fn_sim(a.get("father_or_guardian_name"), b.get("father_or_guardian_name")),
+        _fn_s0(a.get("father_or_guardian_name")), _fn_s0(b.get("father_or_guardian_name")))
+    use("Mother", _fn_sim(a.get("mother_name"), b.get("mother_name")),
+        _fn_s0(a.get("mother_name")), _fn_s0(b.get("mother_name")))
+    use("Spouse", _fn_sim(a.get("spouse_name"), b.get("spouse_name")),
+        _fn_s0(a.get("spouse_name")), _fn_s0(b.get("spouse_name")))
+
+    # ---- category / relation type (the requested "category" connection) ----
+    ca = (a.get("category_type") or "").strip()
+    cb = (b.get("category_type") or "").strip()
+    csim = (1.0 if ca.upper() == cb.upper() else 0.0) if (ca and cb) else None
+    use("Category", csim, ca or None, cb or None)
+    rta = (a.get("relation_type_code") or "").strip()
+    rtb = (b.get("relation_type_code") or "").strip()
+    rtsim = (1.0 if rta.upper() == rtb.upper() else 0.0) if (rta and rtb) else None
+    use("Relation type", rtsim, rta or None, rtb or None)
+
+    # ---- progeny/relation EPIC (link + anchor) -----------------------
+    pea = (a.get("relation_epic") or "").strip()
+    peb = (b.get("relation_epic") or "").strip()
+    pesim = (1.0 if pea == peb else 0.0) if (pea and peb) else None
+    use("Progeny / relation EPIC", pesim, pea or None, peb or None)
+
+    ha, hb = (a.get("house_norm") or ""), (b.get("house_norm") or "")
+    hsim = (1.0 if ha == hb else 0.0) if (ha and hb) else None
+    use("House", hsim, _fn_s0(a.get("house_number")), _fn_s0(b.get("house_number")))
+
+    if not (da and db_):
+        aa = a.get("verified_age") if a.get("verified_age") is not None else a.get("age")
+        ba = b.get("verified_age") if b.get("verified_age") is not None else b.get("age")
+        asim = (max(0.0, 1 - abs(int(aa) - int(ba)) / 10.0)
+                if aa is not None and ba is not None else None)
+        use("Age", asim, aa, ba)
+
+    ga = (a.get("gender") or "").strip().upper()[:1]
+    gb = (b.get("gender") or "").strip().upper()[:1]
+    gsim = (1.0 if ga == gb else 0.0) if (ga and gb) else None
+    use("Gender", gsim, _fn_s0(a.get("gender")), _fn_s0(b.get("gender")))
+
+    return composite, comp, n
+
+
+def _cn_reason(comp: list[dict], composite: float) -> str:
+    agree = [c for c in comp if c["status"] in ("exact", "strong")]
+    agree.sort(key=lambda c: -(c["similarity"] or 0))
+    parts = [f"{c['attribute'].lower()} {c['status']}" for c in agree]
+    diff = [c["attribute"].lower() for c in comp if c["status"] == "differ"]
+    r = f"Cosine match {composite:.0%} — " + ("; ".join(parts) if parts
+                                              else "weak partial signals")
+    if diff:
+        r += ".  Differs on: " + "; ".join(diff)
+    return r + ".  (Different EPIC on each record.)"
+
+
+def _run_cosine_new(c, year: int) -> None:
+    """Callable rule: cosine over the combined profile vector; flag pairs that
+    clear COSINE_NEW_THRESHOLD and carry an identity anchor."""
+    pairs = c.execute(_FN_CANDIDATES_SQL,
+                      {"year": year, "win": CAND_AGE_WINDOW}).fetchall()
+    if not pairs:
+        return
+    rows = c.execute(f"SELECT {_CN_COLS} FROM voters WHERE year = %s",
+                     (year,)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    # Build each voter's profile vector ONCE (not per candidate pair).
+    vecs = {r["id"]: _cn_vec(_cn_fields(r)) for r in rows}
+
+    batch = []
+    for p in pairs:
+        a, b = by_id.get(p["aid"]), by_id.get(p["bid"])
+        if not a or not b:
+            continue
+        composite, comp, n = _cn_score(a, b, vecs[a["id"]], vecs[b["id"]])
+        if comp[0]["similarity"] is None or n < COSINE_NEW_MIN_ATTRS:
+            continue
+        if composite < COSINE_NEW_THRESHOLD:
+            continue
+        # a duplicate must be the same person: the verified names must match
+        if comp[0]["similarity"] < COSINE_NEW_NAME_FLOOR:
+            continue
+        if not _fn_has_anchor(comp):
+            continue
+        # two real, different birth dates => different people (siblings sharing
+        # a surname + parents, not a duplicate). Reject the DOB conflict.
+        if any(c["attribute"] == "Date of birth" and c["status"] == "differ"
+               for c in comp):
+            continue
+        an, asrc = _nm1_name(a)
+        bn, bsrc = _nm1_name(b)
+        sev = "high" if composite >= COSINE_NEW_HIGH else "medium"
+        details = {
+            "method": "cosine_new",
+            "model": "TF-weighted trigram-vector cosine (verified record + "
+                     "category + demographics)",
+            "cosine": round(composite, 3),
+            "similarity": round(composite, 3),
+            "attributes_compared": n,
+            "name_a": an, "name_b": bn,
+            "name_source_a": asrc, "name_source_b": bsrc,
+            "epic_a": a["epic_no"], "epic_b": b["epic_no"],
+            "comparison": comp,          # side-by-side, for the compare PDF
+            "reason": _cn_reason(comp, composite),
+        }
+        batch.append((sev, round(composite, 3), a["id"], b["id"], Json(details)))
+
+    if batch:
+        with c.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO flags (rule, severity, score, voter_id,
+                                      related_voter_id, details)
+                   VALUES ('cosine_new', %s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                batch,
+            )
+
+
 # Each rule: id -> (severity, human description, SQL string OR callable(cursor)).
 # A callable does its own INSERTs into `flags`; a string is executed as-is.
 RULES: dict[str, tuple[str, str, str | Callable]] = {
@@ -946,6 +1164,16 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                   "DOB + father/mother/spouse + progeny (relation) + house/age/"
                   "gender, with a side-by-side attribute comparison on each "
                   "flag", _run_fuzzy_new),
+
+    # ---- cosine_new: TF-weighted trigram-vector cosine over the verified
+    # record + ECINET category + demographics (DOB, father, mother, spouse,
+    # relation type, progeny EPIC, house, gender). Verified name; identity-
+    # anchor gate; side-by-side per-attribute comparison for the compare PDF.
+    "cosine_new": ("medium",
+                   "cosine_new — TF-weighted trigram-vector cosine over verified "
+                   "name + DOB + father/mother/spouse + category + progeny + "
+                   "house/gender, with a side-by-side attribute comparison on "
+                   "each flag", _run_cosine_new),
 }
 
 
