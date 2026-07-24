@@ -481,6 +481,272 @@ def _run_new_model_1(c, year: int) -> None:
             )
 
 
+# =====================================================================
+# fuzzy_new — weighted fuzzy-similarity duplicate model with a side-by-side
+#             attribute comparison (for the PDF compare view)
+# =====================================================================
+# Where new_model_1 sums exact-match evidence, fuzzy_new is a *similarity*
+# model: every shared attribute is scored 0..1 with fuzzy (trigram) matching
+# and folded into one weighted score. It is built for the roll+ECINET record
+# together and deliberately brings in the PROGENY/relation data (the ECINET
+# reference person: relation EPIC + relation name) so two entries that link to
+# the same parent reinforce each other, plus the other demographics — verified
+# DOB, father, mother, spouse, house, age, gender.
+#
+# The voter name comes from the ECINET **verified_name** (roll name only as a
+# fallback). Every attribute it checks — matched OR not — is recorded on the
+# flag as a side-by-side {attribute, a, b, similarity, status} row, so a
+# reviewer (and the comparison PDF) can see exactly which fields agreed and
+# which differed, next to each other.
+FUZZY_NEW_THRESHOLD = 0.72   # weighted similarity needed to raise a flag
+FUZZY_NEW_HIGH      = 0.88   # >= this -> 'high' severity
+FUZZY_NEW_MIN_ATTRS = 3      # need at least this many comparable attributes
+
+# Relative importance of each attribute in the weighted average. The average is
+# taken only over attributes present on BOTH records, so missing enrichment
+# degrades gracefully instead of dragging every score down.
+_FN_WEIGHTS = {
+    "name": 0.30, "dob": 0.16, "father": 0.12, "mother": 0.10,
+    "progeny_epic": 0.10, "progeny_name": 0.08, "spouse": 0.06,
+    "house": 0.04, "age": 0.02, "gender": 0.02,
+}
+
+_FN_COLS = (
+    "id, epic_no, name, verified_name, gender, age, verified_age, "
+    "verified_dob, relation_type, relation_name, relation_name_verified, "
+    "relation_epic, father_or_guardian_name, mother_name, spouse_name, "
+    "house_number, house_norm, constituency_no"
+)
+
+# Candidates: fuzzy-name block (phonetic + age window) UNION progeny block
+# (same relation EPIC) UNION real-DOB block. Within one year, different EPIC.
+_FN_CANDIDATES_SQL = """
+WITH pairs AS (
+    SELECT a.id AS aid, b.id AS bid
+      FROM voters a JOIN voters b
+        ON a.name_phonetic = b.name_phonetic AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s AND a.name_phonetic <> ''
+       AND abs(coalesce(a.age,0) - coalesce(b.age,0)) <= %(win)s
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.relation_epic = b.relation_epic AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.relation_epic,'') <> ''
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+    UNION
+    SELECT a.id, b.id
+      FROM voters a JOIN voters b
+        ON a.verified_dob = b.verified_dob AND a.id < b.id
+       AND a.year = %(year)s AND b.year = %(year)s
+       AND coalesce(a.verified_dob,'') <> '' AND a.verified_dob NOT LIKE '%%-01-01'
+       AND a.epic_no IS DISTINCT FROM b.epic_no
+)
+SELECT DISTINCT aid, bid FROM pairs
+"""
+
+
+def _fn_s0(v) -> str | None:
+    s = (str(v).strip() if v is not None else "")
+    return s or None
+
+
+def _fn_sim(a, b) -> float | None:
+    """Trigram-cosine similarity of two names, or None if either is missing."""
+    an, bn = norm_name(a), norm_name(b)
+    if not an or not bn:
+        return None
+    if an == bn:
+        return 1.0
+    return round(_cosine(_trigrams(an), _trigrams(bn)), 3)
+
+
+def _fn_status(s: float | None) -> str:
+    if s is None:
+        return "—"           # not comparable (missing on a side)
+    if s >= 0.995:
+        return "exact"
+    if s >= 0.85:
+        return "strong"
+    if s >= 0.62:
+        return "partial"
+    if s > 0:
+        return "weak"
+    return "differ"
+
+
+def _fn_score(a: dict, b: dict) -> tuple[float, list[dict], int]:
+    """Weighted fuzzy similarity over every comparable attribute. Returns the
+    composite score, the full side-by-side comparison, and how many attributes
+    were actually comparable."""
+    comp: list[dict] = []
+    wsum = ssum = 0.0
+    n = 0
+
+    def use(label: str, sim: float | None, weight: float, va, vb):
+        nonlocal wsum, ssum, n
+        comp.append({"attribute": label, "a": va, "b": vb,
+                     "similarity": None if sim is None else round(sim, 3),
+                     "weight": weight, "status": _fn_status(sim)})
+        if sim is not None:
+            wsum += weight
+            ssum += weight * sim
+            n += 1
+
+    # ---- verified name (roll name only as fallback) ------------------
+    an, _ = _nm1_name(a)
+    bn, _ = _nm1_name(b)
+    use("Verified name", _fn_sim(an, bn), _FN_WEIGHTS["name"], an or None, bn or None)
+
+    # ---- date of birth (01-Jan placeholder discounted) ---------------
+    da = (a.get("verified_dob") or "").strip()
+    db_ = (b.get("verified_dob") or "").strip()
+    dsim = None
+    if da and db_:
+        if da == db_:
+            dsim = 0.6 if _nm1_is_placeholder_dob(da) else 1.0
+        else:
+            dsim = 0.5 if da[:4] == db_[:4] else 0.0
+    use("Date of birth", dsim, _FN_WEIGHTS["dob"], da or None, db_ or None)
+
+    # ---- parents / spouse --------------------------------------------
+    use("Father / guardian",
+        _fn_sim(a.get("father_or_guardian_name"), b.get("father_or_guardian_name")),
+        _FN_WEIGHTS["father"], _fn_s0(a.get("father_or_guardian_name")),
+        _fn_s0(b.get("father_or_guardian_name")))
+    use("Mother", _fn_sim(a.get("mother_name"), b.get("mother_name")),
+        _FN_WEIGHTS["mother"], _fn_s0(a.get("mother_name")), _fn_s0(b.get("mother_name")))
+    use("Spouse", _fn_sim(a.get("spouse_name"), b.get("spouse_name")),
+        _FN_WEIGHTS["spouse"], _fn_s0(a.get("spouse_name")), _fn_s0(b.get("spouse_name")))
+
+    # ---- progeny / relation (ECINET reference person) ----------------
+    ra = (a.get("relation_epic") or "").strip()
+    rb = (b.get("relation_epic") or "").strip()
+    pesim = (1.0 if ra == rb else 0.0) if (ra and rb) else None
+    use("Progeny / relation EPIC", pesim, _FN_WEIGHTS["progeny_epic"],
+        ra or None, rb or None)
+    pna = a.get("relation_name_verified") or a.get("relation_name")
+    pnb = b.get("relation_name_verified") or b.get("relation_name")
+    use("Progeny / relation name", _fn_sim(pna, pnb), _FN_WEIGHTS["progeny_name"],
+        _fn_s0(pna), _fn_s0(pnb))
+
+    # ---- household ---------------------------------------------------
+    ha, hb = (a.get("house_norm") or ""), (b.get("house_norm") or "")
+    hsim = (1.0 if ha == hb else 0.0) if (ha and hb) else None
+    use("House", hsim, _FN_WEIGHTS["house"], _fn_s0(a.get("house_number")),
+        _fn_s0(b.get("house_number")))
+
+    # ---- age (only when DOB isn't on both sides) ---------------------
+    if not (da and db_):
+        aa = a.get("verified_age") if a.get("verified_age") is not None else a.get("age")
+        ba = b.get("verified_age") if b.get("verified_age") is not None else b.get("age")
+        asim = (max(0.0, 1 - abs(int(aa) - int(ba)) / 10.0)
+                if aa is not None and ba is not None else None)
+        use("Age", asim, _FN_WEIGHTS["age"], aa, ba)
+
+    # ---- gender ------------------------------------------------------
+    ga = (a.get("gender") or "").strip().upper()[:1]
+    gb = (b.get("gender") or "").strip().upper()[:1]
+    gsim = (1.0 if ga == gb else 0.0) if (ga and gb) else None
+    use("Gender", gsim, _FN_WEIGHTS["gender"], _fn_s0(a.get("gender")),
+        _fn_s0(b.get("gender")))
+
+    composite = (ssum / wsum) if wsum > 0 else 0.0
+    return composite, comp, n
+
+
+# A flag needs at least one identity ANCHOR — a signal strong enough to tie two
+# records to the same person. Without one, a high score is just a coincidence of
+# common name + village house + similar age (already covered by dup_identity /
+# fuzzy_dup on the roll fields). The anchor is what makes fuzzy_new the
+# verified-record + progeny model rather than a roll-field rehash. A DOB anchor
+# must be a REAL date: the 01-Jan placeholder only scores 'partial', never here.
+_FN_ANCHOR_EXACT = {"Date of birth", "Progeny / relation EPIC"}
+_FN_ANCHOR_NAME = {"Father / guardian", "Mother", "Spouse"}
+
+
+def _fn_has_anchor(comp: list[dict]) -> bool:
+    for c in comp:
+        if c["attribute"] in _FN_ANCHOR_EXACT and c["status"] == "exact":
+            return True
+        if c["attribute"] in _FN_ANCHOR_NAME and c["status"] in ("exact", "strong"):
+            return True
+    return False
+
+
+def _fn_reason(comp: list[dict], composite: float) -> str:
+    """One-line summary naming the attributes that agreed and those that
+    differed — the same evidence the side-by-side table shows."""
+    agree = [c for c in comp if c["status"] in ("exact", "strong")]
+    agree.sort(key=lambda c: -c["weight"])
+    parts = [f"{c['attribute'].lower()} {c['status']}" for c in agree]
+    diff = [c["attribute"].lower() for c in comp if c["status"] == "differ"]
+    r = f"Fuzzy match {composite:.0%} — " + ("; ".join(parts) if parts
+                                             else "weak partial signals")
+    if diff:
+        r += ".  Differs on: " + "; ".join(diff)
+    return r + ".  (Different EPIC on each record.)"
+
+
+def _run_fuzzy_new(c, year: int) -> None:
+    """Callable rule: score candidate pairs by weighted fuzzy similarity and
+    flag those clearing FUZZY_NEW_THRESHOLD, storing the side-by-side compare."""
+    pairs = c.execute(_FN_CANDIDATES_SQL,
+                      {"year": year, "win": CAND_AGE_WINDOW}).fetchall()
+    if not pairs:
+        return
+    # Load the year's voters once (a single indexed scan) rather than fetching
+    # the involved ids with `id = ANY(<huge array>)` — that array form is a
+    # planner cliff on this dataset and can run for minutes.
+    rows = c.execute(f"SELECT {_FN_COLS} FROM voters WHERE year = %s",
+                     (year,)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+
+    batch = []
+    for p in pairs:
+        a, b = by_id.get(p["aid"]), by_id.get(p["bid"])
+        if not a or not b:
+            continue
+        composite, comp, n = _fn_score(a, b)
+        # need a comparable name and enough evidence to trust the score
+        name_row = comp[0]
+        if name_row["similarity"] is None or n < FUZZY_NEW_MIN_ATTRS:
+            continue
+        if composite < FUZZY_NEW_THRESHOLD:
+            continue
+        # robustness gate: a high score on thin evidence (common name + same
+        # house + similar age, no verified corroboration) is a coincidence, not
+        # a duplicate — require a real identity anchor.
+        if not _fn_has_anchor(comp):
+            continue
+        an, asrc = _nm1_name(a)
+        bn, bsrc = _nm1_name(b)
+        sev = "high" if composite >= FUZZY_NEW_HIGH else "medium"
+        details = {
+            "method": "fuzzy_new",
+            "model": "weighted fuzzy similarity (roll + ECINET + progeny)",
+            "similarity": round(composite, 3),
+            "attributes_compared": n,
+            "name_a": an, "name_b": bn,
+            "name_source_a": asrc, "name_source_b": bsrc,
+            "epic_a": a["epic_no"], "epic_b": b["epic_no"],
+            "comparison": comp,          # side-by-side, for the compare PDF
+            "reason": _fn_reason(comp, composite),
+        }
+        batch.append((sev, round(composite, 3), a["id"], b["id"], Json(details)))
+
+    if batch:
+        with c.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO flags (rule, severity, score, voter_id,
+                                      related_voter_id, details)
+                   VALUES ('fuzzy_new', %s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                batch,
+            )
+
+
 # Each rule: id -> (severity, human description, SQL string OR callable(cursor)).
 # A callable does its own INSERTs into `flags`; a string is executed as-is.
 RULES: dict[str, tuple[str, str, str | Callable]] = {
@@ -669,6 +935,17 @@ RULES: dict[str, tuple[str, str, str | Callable]] = {
                     "ECINET-verified record (Aadhaar / verified DOB / verified "
                     "name / mobile / parent-EPIC), quality-aware, with a "
                     "per-signal reason on each flag", _run_new_model_1),
+
+    # ---- fuzzy_new: weighted fuzzy-similarity over the roll + ECINET record,
+    # including progeny/relation links and the other demographics (verified
+    # DOB, father, mother, spouse, house, age, gender). Uses the verified name,
+    # and records a side-by-side per-attribute comparison on every flag for the
+    # duplicate-comparison PDF.
+    "fuzzy_new": ("medium",
+                  "fuzzy_new — weighted fuzzy similarity over verified name + "
+                  "DOB + father/mother/spouse + progeny (relation) + house/age/"
+                  "gender, with a side-by-side attribute comparison on each "
+                  "flag", _run_fuzzy_new),
 }
 
 
